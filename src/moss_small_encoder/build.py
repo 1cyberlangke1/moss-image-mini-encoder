@@ -33,7 +33,7 @@ import yaml
 from tqdm import tqdm
 
 from . import clean, labels, synth_layout
-from .sources import SOURCES, goku, gustavosta, jtatman, moss_official, n714, shuixian
+from .sources import SOURCES, entities, goku, gustavosta, jtatman, moss_official, n714, shuixian
 from .tokenizer import MAX_TEXT_TOKENS, MossTokenizer
 
 # 源 -> 清洗函数。每个函数只做「这个词源已知的污染」。
@@ -251,13 +251,15 @@ def _iter_synth(bucket: dict, cfg: dict) -> Iterator[dict]:
     Yields:
         文本已就绪、无需清洗的记录。
     """
-    for item in synth_layout.generate_layouts(
-        bucket["quota"], cfg["seed"], bucket.get("lang_mix", 0.5)
+    for index, item in enumerate(
+        synth_layout.generate_layouts(
+            bucket["quota"], cfg["seed"], bucket.get("lang_mix", 0.5)
+        )
     ):
         yield {
             "text": item["text"],
             "source": "synth_layout",
-            "source_id": f"{item['variant']}:{item['width']}x{item['height']}:{item['n_items']}",
+            "source_id": f"{item['variant']}:{item['width']}x{item['height']}:{item['n_items']}:{index:04d}",
             "kind": "positive",
             "nsfw": False,
             "meta": {
@@ -267,6 +269,39 @@ def _iter_synth(bucket: dict, cfg: dict) -> Iterator[dict]:
                 "n_items": item["n_items"],
             },
             "lang": item["lang"],
+        }
+
+
+def _iter_entities(bucket: dict, cfg: dict) -> Iterator[dict]:
+    """产出 Wikidata 实体的场景变体（只给名字，不给外观描述）。
+
+    Args:
+        bucket: 桶配置（含 entities 路径、per_entity、min_sitelinks）。
+        cfg: 全局配置（用到 seed）。
+
+    Yields:
+        文本已就绪、无需清洗的记录。
+
+    Notes:
+        这个桶的文本是纯枚举出来的，没有上游语料要洗；
+        它存在的唯一目的是把「名字 → 外观」的绑定喂进教师，
+        所以文本里绝不能出现我们自己写的属性词喵。
+    """
+    for record in entities.iter_records(
+        Path(bucket["entities"]),
+        per_entity=bucket["per_entity"],
+        seed=cfg["seed"],
+        min_sitelinks=bucket.get("min_sitelinks", 0),
+    ):
+        yield {
+            "text": record["text"],
+            "source": "wikidata",
+            "source_id": record["source_id"],
+            "kind": "positive",
+            "nsfw": False,
+            "meta": record["meta"],
+            "lang": record["lang"],
+            "record_id": record["id"],
         }
 
 
@@ -319,6 +354,7 @@ ITERATORS: dict[str, Callable[[dict, dict], Iterator[dict]]] = {
     "stream": _iter_stream,
     "synth": _iter_synth,
     "tag_compose": _iter_tags,
+    "enumerate": _iter_entities,
     "official": _iter_official,
 }
 
@@ -384,7 +420,7 @@ def collect_bucket(
 
     rows = []
     for item in kept:
-        record_id = f"{bucket['name']}:{item['source']}:{item['source_id']}"
+        # 桶自己给了唯一 id 就用它：layout / entity 这类一个源 id 会展开成多条记录，`n        # 用 source_id 拼 id 会撞车（历史上 layout 就撞出 3000 行同 id）喵。`n        record_id = item.get("record_id") or f"{bucket['name']}:{item['source']}:{item['source_id']}"
         text = item["text"]
         lang = item.get("lang") or clean.detect_lang(text)
         nsfw = item["nsfw"]
