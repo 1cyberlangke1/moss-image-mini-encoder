@@ -1,0 +1,17 @@
+[project]
+name = "comfyui-moss-smaller-encoder"
+version = "0.1.0"
+description = "用 Qwen3.5-0.8B / 2B + 线性投影替代 MOSS-Image 的 9B 文本编码器"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = ["safetensors>=0.4.0"]
+
+# torch 由 ComfyUI 自身提供，不在这里声明，避免版本冲突。
+
+[tool.comfy]
+# 发到 ComfyUI Registry 才需要：注册后把账号的 PublisherId 填进来。
+# 不打算发布到 Registry 就保持注释，直接 git clone 到 custom_nodes/ 即可喵。
+# PublisherId = ""
+DisplayName = "MOSS Smaller Encoder"
+Icon = ""
+requires-comfyui = ">=0.42.0"
