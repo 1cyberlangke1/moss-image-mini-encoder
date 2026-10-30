@@ -74,6 +74,12 @@ build-*/
 !/dataset/dataset_card.md
 !/dataset/manifest.json
 
+# 编码产物（teacher/student 特征，合计约 62 GB）与训练导出的适配器，
+# 都是可复现的中间产物，不入库。
+/features/*
+/artifacts/*
+/output/*
+
 # AI AGENT 本地笔记（不入库）
 AGENTS.md
 PLAN.md

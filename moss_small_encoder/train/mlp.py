@@ -26,6 +26,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .ridge import check_ram_limit, get_memory_info, trim_memory
+
 torch = None
 nn = None
 
@@ -71,12 +73,12 @@ class MLPConfig:
     hidden: int = 8192
     depth: int = 2
     epochs: int = 60
-    batch: int = 8192
+    batch: int = 24576
     lr: float = 1e-3
     weight_decay: float = 0.01
     patience: int = 8
     seed: int = 20261027
-    eval_tokens: int = 200_000
+    eval_tokens: int = 100_000
     amp: bool = True
     compile: bool = True
     compile_mode: str = "default"
@@ -85,6 +87,13 @@ class MLPConfig:
     # "frozen"：W 固定为 Ridge 解，只训残差（参考项目主配置）。
     linear_mode: str = "joint"
     linear_lr_scale: float = 0.1
+    checkpoint_dir: str | None = "output/checkpoints"
+    save_every_steps: int = 25
+    keep_last_checkpoints: int = 3
+    resume: str | None = None
+    min_lr_ratio: float = 0.01
+    min_sys_available_gb: float = 2.0
+    max_process_ram_gb: float = 14.0
 
 
 def build(d_in: int, d_out: int, hidden: int, depth: int, zero_init: bool = True):
@@ -146,23 +155,113 @@ class TrainResult:
         return self.best_val_cosine - self.base_val_cosine
 
 
-def _cosine_rows(pred, target) -> float:
-    """分批计算逐行余弦均值，避免一次算太大。
+class CheckpointManager:
+    """按步数间隔保存检查点，并只保留最近 N 个检查点（防止磁盘撑爆）。"""
+
+    def __init__(self, directory: Path | str, save_every_steps: int = 25, keep_last: int = 3):
+        self.directory = Path(directory)
+        self.save_every_steps = int(save_every_steps)
+        self.keep_last = int(keep_last)
+        self.saved_ckpts: list[Path] = []
+        self.directory.mkdir(parents=True, exist_ok=True)
+
+    def should_save(self, global_step: int) -> bool:
+        return self.save_every_steps > 0 and (global_step > 0 and global_step % self.save_every_steps == 0)
+
+    def save(
+        self,
+        global_step: int,
+        epoch: int,
+        net,
+        optimizer,
+        scheduler,
+        extra: dict | None = None,
+    ) -> Path:
+        raw_net = net._orig_mod if hasattr(net, "_orig_mod") else net
+        ckpt_path = self.directory / f"checkpoint_step_{global_step:06d}.pt"
+        data = {
+            "global_step": global_step,
+            "epoch": epoch,
+            "model_state": {k: v.cpu() for k, v in raw_net.state_dict().items()},
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict() if scheduler else None,
+            **(extra or {}),
+        }
+        torch.save(data, ckpt_path)
+        torch.save(data, self.directory / "checkpoint_latest.pt")
+        self.saved_ckpts.append(ckpt_path)
+
+        if self.keep_last > 0 and len(self.saved_ckpts) > self.keep_last:
+            to_remove = self.saved_ckpts[:-self.keep_last]
+            for p in to_remove:
+                try:
+                    if p.exists() and p != ckpt_path:
+                        p.unlink()
+                except OSError:
+                    pass
+            self.saved_ckpts = self.saved_ckpts[-self.keep_last:]
+
+        return ckpt_path
+
+    def save_best(
+        self,
+        global_step: int,
+        epoch: int,
+        net,
+        val_cosine: float,
+        best_cosine: float,
+        extra: dict | None = None,
+    ) -> Path:
+        raw_net = net._orig_mod if hasattr(net, "_orig_mod") else net
+        best_path = self.directory / "checkpoint_best.pt"
+        data = {
+            "global_step": global_step,
+            "epoch": epoch,
+            "model_state": {k: v.cpu() for k, v in raw_net.state_dict().items()},
+            "val_cosine": val_cosine,
+            "best_cosine": best_cosine,
+            **(extra or {}),
+        }
+        torch.save(data, best_path)
+        return best_path
+
+
+def _cosine_rows(pred, target, block_size: int = 8192) -> float:
+    """分批计算逐行余弦均值，避免一次分配过大中间张量。
 
     Args:
         pred: `[n, d]` 预测。
         target: `[n, d]` 目标。
+        block_size: 分批计算步长，默认 8192 行（显存占用 <140MB）。
 
     Returns:
         均值余弦。
     """
     torch, _ = _require_torch()
-    dot = (pred * target).sum(1)
-    norm = pred.norm(dim=1) * target.norm(dim=1)
-    valid = norm > 0
-    if not bool(valid.any()):
+    n = pred.shape[0]
+    if n == 0:
         return 0.0
-    return float((dot[valid] / norm[valid]).mean())
+    if n <= block_size:
+        dot = (pred * target).sum(1)
+        norm = pred.norm(dim=1) * target.norm(dim=1)
+        valid = norm > 0
+        if not bool(valid.any()):
+            return 0.0
+        return float((dot[valid] / norm[valid]).mean())
+
+    total_cos = 0.0
+    valid_count = 0
+    for i in range(0, n, block_size):
+        end = min(i + block_size, n)
+        p_sub = pred[i:end]
+        t_sub = target[i:end]
+        dot = (p_sub * t_sub).sum(1)
+        norm = p_sub.norm(dim=1) * t_sub.norm(dim=1)
+        valid = norm > 0
+        if bool(valid.any()):
+            total_cos += float((dot[valid] / norm[valid]).sum())
+            valid_count += int(valid.sum())
+    return total_cos / max(1, valid_count)
 
 
 def train(
@@ -259,106 +358,353 @@ def train(
     else:
         optimizer = torch.optim.AdamW(params, lr=config.lr, weight_decay=config.weight_decay)
         clip_params = list(params)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config.epochs, eta_min=config.lr * config.min_lr_ratio
+    )
 
-    def to_tensors(indices: np.ndarray):
-        """把 token 下标取成标准化后的输入与标准化空间的目标。
+    ckpt_mgr = (
+        CheckpointManager(
+            config.checkpoint_dir,
+            save_every_steps=config.save_every_steps,
+            keep_last=config.keep_last_checkpoints,
+        )
+        if config.checkpoint_dir
+        else None
+    )
+    start_epoch = 0
+    global_step = 0
 
-        Args:
-            indices: 一维 token 下标数组。
+    if config.resume:
+        resume_p = Path(config.resume)
+        if resume_p.is_dir():
+            resume_p = resume_p / "checkpoint_latest.pt"
+        if resume_p.exists():
+            log(f"  [Resume] 恢复检查点: {resume_p}")
+            ckpt = torch.load(resume_p, map_location=device)
+            raw_net.load_state_dict(ckpt["model_state"])
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+            if ckpt.get("scheduler_state") and scheduler:
+                scheduler.load_state_dict(ckpt["scheduler_state"])
+            start_epoch = ckpt.get("epoch", 0) + 1
+            global_step = ckpt.get("global_step", 0)
+            log(f"  [Resume] 成功从 Epoch {start_epoch} (全局步 {global_step}) 继续训练")
 
-        Returns:
-            `(z, y_std, y_raw)`，前两个用于训练，`y_raw` 用于验证时回原空间。
-        """
-        x = torch.from_numpy(np.asarray(store.student[indices], dtype=np.float32))
-        y = torch.from_numpy(np.asarray(store.teacher[indices], dtype=np.float32))
-        x = x.to(device)
-        y = y.to(device)
-        return (x - mean_in) / std_in, (y - mean_out) / std_out, y
+    is_stream = hasattr(store, "read_chunk_into")
 
-    def evaluate() -> float:
-        """在验证 token 上算原始空间余弦。
+    if is_stream:
+        # ---- 真流式读取分支：复用单一缓冲区，内存锁死在安全线，GPU 显存吃满 ----
+        chunk_token_target = 65_536
+        buf_capacity = chunk_token_target + config.batch + 8192
+        buf_x = np.empty((buf_capacity, store.d_in), dtype=np.float16)
+        buf_y = np.empty((buf_capacity, store.d_out), dtype=np.float16)
 
-        Returns:
-            平均余弦。
-        """
-        net.eval()
-        cos_sum = 0.0
-        total_n = 0
+        val_prompts = np.sort(splits["val"])
+        val_target = min(config.eval_tokens, int(store.lengths[val_prompts].sum()) - len(val_prompts))
+        val_p_list: list[int] = []
+        cur_v = 0
+        for p in val_prompts:
+            val_p_list.append(p)
+            cur_v += int(store.lengths[p]) - 1
+            if cur_v >= val_target:
+                break
+
+        def evaluate(use_ref: bool = False) -> float:
+            target_name = "Ridge 基准" if use_ref else "模型验证"
+            log(f"  [Eval] 正在评估{target_name} (目标 {val_target:,} tokens)...")
+            eval_t0 = time.time()
+            net.eval()
+            cos_sum = 0.0
+            total_n = 0
+            with torch.no_grad():
+                v_idx = 0
+                while v_idx < len(val_p_list):
+                    v_batch: list[int] = []
+                    v_cur = 0
+                    while v_idx < len(val_p_list) and (v_cur == 0 or v_cur < chunk_token_target):
+                        pid = int(val_p_list[v_idx])
+                        v_batch.append(pid)
+                        v_cur += int(store.lengths[pid])
+                        v_idx += 1
+                    n_v = store.read_chunk_into(v_batch, buf_x, buf_y, drop_first=1)
+                    if n_v < 1:
+                        continue
+                    # 分 batch 走模型推理，防止一次性 6.5 万 token 撑爆显存
+                    for b_start in range(0, n_v, config.batch):
+                        b_end = min(b_start + config.batch, n_v)
+                        b_size = b_end - b_start
+                        if b_size < 1:
+                            continue
+                        xb = torch.from_numpy(buf_x[b_start:b_end]).to(device).float()
+                        yb = torch.from_numpy(buf_y[b_start:b_end]).to(device).float()
+                        z = (xb - mean_in) / std_in
+                        with autocast():
+                            if use_ref:
+                                pred_std = z @ W_ref
+                            else:
+                                pred_std = (z @ W_used if use_ridge else 0) + net(z)
+                        pred_raw = pred_std.float() * std_out + mean_out
+                        cos_sum += _cosine_rows(pred_raw, yb) * b_size
+                        total_n += b_size
+                        del xb, yb, z, pred_std, pred_raw
+            net.train()
+            val_cos = cos_sum / max(1, total_n)
+            log(f"  [Eval] {target_name}评估完成: 余弦 {val_cos:.5f} | 耗时 {time.time() - eval_t0:.1f}s")
+            return val_cos
+
+        base_cosine = evaluate(use_ref=True)
+        best = base_cosine
+        best_state = copy.deepcopy(net.state_dict())
+        best_epoch = -1
+        stale = 0
+        history: list[tuple[int, float, float]] = []
+        started = time.time()
+
+        train_p_all = np.sort(splits["train"])
+        train_total_tokens = sum(int(store.lengths[p]) - 1 for p in train_p_all)
+        total_steps = max(1, (train_total_tokens + config.batch - 1) // config.batch)
+        train_x_buf = buf_x
+        train_y_buf = buf_y
+
+        for epoch in range(start_epoch, config.epochs):
+            epoch_t0 = time.time()
+            # 严格单向纯流式顺序读取：按磁盘物理位置升序遍历，绝对不打乱 prompt 顺序！
+            p_order = train_p_all
+            running = 0.0
+            steps = 0
+            p_idx = 0
+            leftover_n = 0
+
+            step_t0 = time.time()
+            recent_tokens = 0
+            recent_steps = 0
+
+            while p_idx < len(p_order) or leftover_n > 0:
+                # 1. 只要还有 prompt，就拉入下一个 chunk 追加在未成 batch 的尾数后面
+                if p_idx < len(p_order):
+                    p_batch: list[int] = []
+                    cur_tokens = 0
+                    while p_idx < len(p_order) and (cur_tokens == 0 or cur_tokens < chunk_token_target):
+                        pid = int(p_order[p_idx])
+                        p_batch.append(pid)
+                        cur_tokens += int(store.lengths[pid])
+                        p_idx += 1
+
+                    n_read = store.read_chunk_into(
+                        p_batch, train_x_buf, train_y_buf, drop_first=1, offset=leftover_n
+                    )
+                    total_avail = leftover_n + n_read
+                else:
+                    total_avail = leftover_n
+                    n_read = 0
+
+                if total_avail < 2:
+                    break
+
+                # 2. 如果已到本轮所有 prompt 的终点，允许最后一步小于完整 batch
+                is_epoch_end = (p_idx >= len(p_order))
+                if is_epoch_end:
+                    num_batches = (total_avail + config.batch - 1) // config.batch
+                else:
+                    num_batches = total_avail // config.batch
+
+                # 3. 逐 batch 执行梯度更新，中间所有批次大小均严格等于 config.batch
+                for b in range(num_batches):
+                    b_start = b * config.batch
+                    b_end = min(b_start + config.batch, total_avail)
+                    b_size = b_end - b_start
+                    if b_size < 2:
+                        continue
+
+                    xt = torch.from_numpy(train_x_buf[b_start:b_end]).to(device).float()
+                    yt = torch.from_numpy(train_y_buf[b_start:b_end]).to(device).float()
+                    perm = torch.randperm(b_size, device=device)
+                    z = ((xt - mean_in) / std_in)[perm]
+                    y_std = ((yt - mean_out) / std_out)[perm]
+                    del xt, yt
+
+                    if epoch == 0 and steps == 0 and config.compile:
+                        log("  [JIT] 正在首次编译计算图 (torch.compile，首次耗时约几十秒)...")
+
+                    with autocast():
+                        pred_std = (z @ W_used if use_ridge else 0) + net(z)
+                        loss = torch.nn.functional.mse_loss(pred_std.float(), y_std)
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
+                    optimizer.step()
+
+                    loss_val = float(loss.detach())
+                    running += loss_val
+                    steps += 1
+                    global_step += 1
+                    recent_tokens += b_size
+                    recent_steps += 1
+                    del z, y_std, pred_std, loss
+
+                    if ckpt_mgr and ckpt_mgr.should_save(global_step):
+                        ckpt_p = ckpt_mgr.save(
+                            global_step, epoch, raw_net, optimizer, scheduler, {"loss": loss_val}
+                        )
+                        log(
+                            f"  [Checkpoint] 旋转检查点已存盘 (步 {global_step}, 保留最近 {ckpt_mgr.keep_last} 个): {ckpt_p.name}"
+                        )
+
+                    if steps == 1 or steps % 25 == 0 or steps == total_steps:
+                        dt = time.time() - step_t0
+                        cur_lr = optimizer.param_groups[-1]["lr"]
+                        rss_gb, sys_avail_gb, vram_gb = get_memory_info()
+                        tok_s = recent_tokens / max(1e-4, dt)
+                        ms_step = (dt / max(1, recent_steps)) * 1000
+                        log(
+                            f"  [E{epoch:02d}|步 {steps:3d}/{total_steps}] loss: {loss_val:.5f} | "
+                            f"lr: {cur_lr:.2e} | {ms_step:.1f}ms/步 ({tok_s/1e3:.0f}k tok/s) | "
+                            f"RAM: {rss_gb:.2f}GB (可用 {sys_avail_gb:.1f}GB) | VRAM: {vram_gb:.2f}GB"
+                        )
+                        step_t0 = time.time()
+                        recent_tokens = 0
+                        recent_steps = 0
+
+                # 4. 若未到轮末，将未满整 batch 的余数结转到 buffer 起始处
+                if not is_epoch_end:
+                    processed = num_batches * config.batch
+                    leftover_n = total_avail - processed
+                    if leftover_n > 0:
+                        train_x_buf[:leftover_n] = train_x_buf[processed:total_avail]
+                        train_y_buf[:leftover_n] = train_y_buf[processed:total_avail]
+                else:
+                    leftover_n = 0
+
+            scheduler.step()
+            val_cosine = evaluate()
+            mean_loss = running / max(1, steps)
+            history.append((epoch, mean_loss, val_cosine))
+
+            trim_memory()
+            check_ram_limit(config.min_sys_available_gb, config.max_process_ram_gb)
+
+            if val_cosine > best + 1e-6:
+                best = val_cosine
+                best_state = copy.deepcopy(raw_net.state_dict())
+                best_epoch = epoch
+                stale = 0
+                if ckpt_mgr:
+                    ckpt_mgr.save_best(
+                        global_step, epoch, raw_net, val_cosine, best, {"mean_loss": mean_loss}
+                    )
+                    log(f"  [Checkpoint] 最佳检查点已更新: checkpoint_best.pt (余弦: {best:.5f})")
+            else:
+                stale += 1
+
+            if ckpt_mgr:
+                ckpt_mgr.save(
+                    global_step, epoch, raw_net, optimizer, scheduler,
+                    {"val_cosine": val_cosine, "mean_loss": mean_loss}
+                )
+
+            log(
+                f"  ==> Epoch {epoch:02d} 完成 | 平均 loss: {mean_loss:.6f} | 验证集余弦: {val_cosine:.5f}"
+                f" (最佳: {best:.5f}) | 耗时: {time.time() - epoch_t0:.1f}s"
+            )
+            if stale >= config.patience:
+                log(f"  早停：{config.patience} 轮无提升（最好在第 {best_epoch} 轮）")
+                break
+
+        del train_x_buf, train_y_buf, buf_x, buf_y
+        trim_memory()
+
+    else:
+        # ---- 兼容普通 FeatureStore（单元测试小数据集用）----
+        def to_tensors(indices: np.ndarray):
+            x = (
+                torch.from_numpy(np.ascontiguousarray(store.student[indices]))
+                .to(device)
+                .float()
+            )
+            y = (
+                torch.from_numpy(np.ascontiguousarray(store.teacher[indices]))
+                .to(device)
+                .float()
+            )
+            return (x - mean_in) / std_in, (y - mean_out) / std_out, y
+
+        def evaluate() -> float:
+            net.eval()
+            cos_sum = 0.0
+            total_n = 0
+            with torch.no_grad():
+                for start in range(0, val_idx.size, 16384):
+                    chunk = val_idx[start : start + 16384]
+                    z, _, y_raw = to_tensors(chunk)
+                    with autocast():
+                        pred_std = (z @ W_used if use_ridge else 0) + net(z)
+                    pred_raw = pred_std.float() * std_out + mean_out
+                    cos_sum += _cosine_rows(pred_raw, y_raw) * chunk.size
+                    total_n += int(chunk.size)
+            net.train()
+            return cos_sum / max(1, total_n)
+
+        base_cosine = 0.0
         with torch.no_grad():
+            net.eval()
+            cos_sum = 0.0
+            total_n = 0
             for start in range(0, val_idx.size, 16384):
                 chunk = val_idx[start : start + 16384]
                 z, _, y_raw = to_tensors(chunk)
                 with autocast():
-                    pred_std = (z @ W_used if use_ridge else 0) + net(z)
-                # 余弦在 fp32 里算：bf16 只有 8 位尾数，算距离会明显失真。
+                    pred_std = z @ W_ref
                 pred_raw = pred_std.float() * std_out + mean_out
                 cos_sum += _cosine_rows(pred_raw, y_raw) * chunk.size
                 total_n += int(chunk.size)
+            base_cosine = cos_sum / max(1, total_n)
         net.train()
-        return cos_sum / max(1, total_n)
 
-    base_cosine = 0.0
-    with torch.no_grad():
-        net.eval()
-        cos_sum = 0.0
-        total_n = 0
-        for start in range(0, val_idx.size, 16384):
-            chunk = val_idx[start : start + 16384]
-            z, _, y_raw = to_tensors(chunk)
-            with autocast():
-                pred_std = z @ W_ref
-            pred_raw = pred_std.float() * std_out + mean_out
-            cos_sum += _cosine_rows(pred_raw, y_raw) * chunk.size
-            total_n += int(chunk.size)
-        base_cosine = cos_sum / max(1, total_n)
-    net.train()
+        best = base_cosine
+        best_state = copy.deepcopy(net.state_dict())
+        best_epoch = -1
+        stale = 0
+        history = []
+        started = time.time()
 
-    best = base_cosine
-    best_state = copy.deepcopy(net.state_dict())
-    best_epoch = -1
-    stale = 0
-    history: list[tuple[int, float, float]] = []
-    started = time.time()
-
-    for epoch in range(config.epochs):
-        order = rng.permutation(train_idx)
-        running = 0.0
-        steps = 0
-        for start in range(0, order.size, config.batch):
-            chunk = order[start : start + config.batch]
-            if chunk.size < 2:
-                continue
-            z, y_std, _ = to_tensors(chunk)
-            with autocast():
-                pred_std = (z @ W_used if use_ridge else 0) + net(z)
-                # 损失在 fp32 里算：bf16 的尾数不够，MSE 会被量化误差带偏。
-                loss = torch.nn.functional.mse_loss(pred_std.float(), y_std)
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
-            optimizer.step()
-            running += float(loss.detach())
-            steps += 1
-        scheduler.step()
-        val_cosine = evaluate()
-        mean_loss = running / max(1, steps)
-        history.append((epoch, mean_loss, val_cosine))
-        if val_cosine > best + 1e-6:
-            best = val_cosine
-            best_state = copy.deepcopy(net.state_dict())
-            best_epoch = epoch
-            stale = 0
-        else:
-            stale += 1
-        if epoch % 5 == 0 or stale == 0:
-            log(
-                f"  epoch {epoch:3d}  loss {mean_loss:.6f}  val_cos {val_cosine:.5f}"
-                f"  best {best:.5f}  ({time.time() - started:.0f}s)"
-            )
-        if stale >= config.patience:
-            log(f"  早停：{config.patience} 轮无提升（最好在第 {best_epoch} 轮）")
-            break
+        for epoch in range(config.epochs):
+            order = rng.permutation(train_idx)
+            running = 0.0
+            steps = 0
+            for start in range(0, order.size, config.batch):
+                chunk = order[start : start + config.batch]
+                if chunk.size < 2:
+                    continue
+                z, y_std, _ = to_tensors(chunk)
+                with autocast():
+                    pred_std = (z @ W_used if use_ridge else 0) + net(z)
+                    loss = torch.nn.functional.mse_loss(pred_std.float(), y_std)
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
+                optimizer.step()
+                running += float(loss.detach())
+                steps += 1
+            scheduler.step()
+            val_cosine = evaluate()
+            mean_loss = running / max(1, steps)
+            history.append((epoch, mean_loss, val_cosine))
+            trim_memory()
+            check_ram_limit(config.min_sys_available_gb, config.max_process_ram_gb)
+            if val_cosine > best + 1e-6:
+                best = val_cosine
+                best_state = copy.deepcopy(net.state_dict())
+                best_epoch = epoch
+                stale = 0
+            else:
+                stale += 1
+            if epoch % 5 == 0 or stale == 0:
+                log(
+                    f"  epoch {epoch:3d}  loss {mean_loss:.6f}  val_cos {val_cosine:.5f}"
+                    f"  best {best:.5f}  ({time.time() - started:.0f}s)"
+                )
+            if stale >= config.patience:
+                log(f"  早停：{config.patience} 轮无提升（最好在第 {best_epoch} 轮）")
+                break
 
     trained_W = (
         W_used.detach().float().cpu().numpy() if joint else solution.W
@@ -370,6 +716,42 @@ def train(
         epochs_run=len(history),
         state=best_state,
         history=history,
+    )
+
+
+def save_linear(path: Path, solution, meta: dict | None = None) -> None:
+    """把纯线性 Ridge 参数导出成对标原参考项目的 safetensors。
+
+    Args:
+        path: 输出路径。
+        solution: Ridge 解。
+        meta: 额外元数据。
+    """
+    torch, _ = _require_torch()
+    try:
+        from safetensors.torch import save_file
+    except ImportError as error:
+        raise ImportError("导出需要 safetensors：pip install safetensors") from error
+
+    tensors = {
+        "weight": torch.from_numpy(solution.W).half().contiguous(),
+        "mean_in": torch.from_numpy(solution.mean_in).float().contiguous(),
+        "std_in": torch.from_numpy(solution.std_in).float().contiguous(),
+        "mean_out": torch.from_numpy(solution.mean_out).float().contiguous(),
+        "std_out": torch.from_numpy(solution.std_out).float().contiguous(),
+    }
+    metadata = {
+        "format": "potatoforge_moss_encoder_projection_v1",
+        "source_layer": "last_normalized",
+        "target_layer": "last_normalized",
+        "alpha": str(solution.lam),
+    }
+    if meta:
+        metadata.update({k: str(v) for k, v in meta.items()})
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    save_file(tensors, str(path), metadata=metadata)
+    Path(path).with_suffix(".json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
 
 

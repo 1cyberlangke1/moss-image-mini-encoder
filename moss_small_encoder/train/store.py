@@ -238,3 +238,201 @@ class FeatureStore:
         if not blocks:
             return np.empty(0, dtype=np.int64)
         return np.concatenate(blocks)
+
+    def token_spans(self, prompt_indices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """把 prompt 下标折叠成连续 token 区间（升序、互不重叠）。
+
+        Args:
+            prompt_indices: prompt 序号数组（顺序不限）。
+
+        Returns:
+            `(starts, ends)`，第 i 个区间是 `[starts[i], ends[i])`。
+
+        Notes:
+            排序后的 prompt 下标在 token 轴上常形成连续段；折叠后
+            区间数远少于 prompt 数，下游可以按区间顺序流式切片。
+        """
+        order = np.sort(np.asarray(prompt_indices, dtype=np.int64))
+        starts = np.concatenate(([0], np.cumsum(self.lengths)))
+        begin = starts[order]
+        end = starts[order + 1]
+        merged_s: list[int] = []
+        merged_e: list[int] = []
+        for s, e in zip(begin.tolist(), end.tolist()):
+            if merged_s and s <= merged_e[-1]:
+                merged_e[-1] = max(merged_e[-1], e)
+            else:
+                merged_s.append(s)
+                merged_e.append(e)
+        return (
+            np.asarray(merged_s, dtype=np.int64),
+            np.asarray(merged_e, dtype=np.int64),
+        )
+
+
+class PromptFeatureDataset:
+    """标准 PyTorch Dataset，通过文件流式 seek/read 按 prompt 读取特征，零 memmap 膨胀。"""
+
+    def __init__(self, directory: Path, prompt_indices: Sequence[int], drop_first: int = 1):
+        import torch
+
+        self.directory = Path(directory)
+        meta = json.loads((self.directory / "meta.json").read_text(encoding="utf-8"))
+        self.d_in = int(meta["d_in"])
+        self.d_out = int(meta["d_out"])
+        self.lengths = np.asarray(meta["lengths"], dtype=np.int64)
+        self.starts = np.concatenate(([0], np.cumsum(self.lengths)))
+        self.indices = np.asarray(prompt_indices, dtype=np.int64)
+        self.drop_first = drop_first
+        self.f_student = open(self.directory / "student.raw", "rb")
+        self.f_teacher = open(self.directory / "teacher.raw", "rb")
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx: int):
+        import torch
+
+        p = int(self.indices[idx])
+        L = int(self.lengths[p])
+        s = int(self.starts[p])
+        offset = min(self.drop_first, L)
+        valid_L = L - offset
+        if valid_L <= 0:
+            return (
+                torch.empty((0, self.d_in), dtype=torch.float16),
+                torch.empty((0, self.d_out), dtype=torch.float16),
+            )
+
+        self.f_student.seek((s + offset) * self.d_in * 2)
+        x = torch.frombuffer(
+            bytearray(self.f_student.read(valid_L * self.d_in * 2)),
+            dtype=torch.float16,
+        ).view(valid_L, self.d_in)
+
+        self.f_teacher.seek((s + offset) * self.d_out * 2)
+        y = torch.frombuffer(
+            bytearray(self.f_teacher.read(valid_L * self.d_out * 2)),
+            dtype=torch.float16,
+        ).view(valid_L, self.d_out)
+
+        return x, y
+
+    def close(self):
+        self.f_student.close()
+        self.f_teacher.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def collate_prompt_features(batch):
+    """PyTorch DataLoader collate 函数：拼接 batch 内各 prompt 的 token。"""
+    import torch
+
+    xs = [b[0] for b in batch if b[0].shape[0] > 0]
+    ys = [b[1] for b in batch if b[1].shape[0] > 0]
+    if not xs:
+        return torch.empty((0, 1024), dtype=torch.float16), torch.empty((0, 4096), dtype=torch.float16)
+    return torch.cat(xs, dim=0), torch.cat(ys, dim=0)
+
+
+class StreamReader:
+    """直接使用标准二进制文件流读取特征，不依赖 np.memmap，彻底杜绝操作系统工作集膨胀。"""
+
+    def __init__(self, directory: Path):
+        self.directory = Path(directory)
+        meta = json.loads((self.directory / "meta.json").read_text(encoding="utf-8"))
+        self.d_in = int(meta["d_in"])
+        self.d_out = int(meta["d_out"])
+        self.n_tokens = int(meta["n_tokens"])
+        self.lengths = np.asarray(meta["lengths"], dtype=np.int64)
+        self.prompt_ids = list(meta["prompt_ids"])
+        self.starts = np.concatenate(([0], np.cumsum(self.lengths)))
+        self.f_student = open(self.directory / "student.raw", "rb")
+        self.f_teacher = open(self.directory / "teacher.raw", "rb")
+
+    def close(self):
+        self.f_student.close()
+        self.f_teacher.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    @property
+    def n_prompts(self) -> int:
+        return int(self.lengths.shape[0])
+
+    def split_by_prompt(self, ratios: dict[str, float]) -> dict[str, np.ndarray]:
+        import hashlib
+
+        keys = np.array(
+            [
+                int(hashlib.sha1(pid.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
+                for pid in self.prompt_ids
+            ]
+        )
+        train_cut = ratios["train"]
+        val_cut = train_cut + ratios["val"]
+        return {
+            "train": np.flatnonzero(keys < train_cut),
+            "val": np.flatnonzero((keys >= train_cut) & (keys < val_cut)),
+            "test": np.flatnonzero(keys >= val_cut),
+        }
+
+    def token_indices(self, prompt_indices: np.ndarray) -> np.ndarray:
+        starts = np.concatenate(([0], np.cumsum(self.lengths)))
+        blocks = [
+            np.arange(starts[i], starts[i + 1], dtype=np.int64) for i in prompt_indices
+        ]
+        if not blocks:
+            return np.empty(0, dtype=np.int64)
+        return np.concatenate(blocks)
+
+    def read_chunk_into(
+        self,
+        prompt_indices: Sequence[int],
+        x_buf: np.ndarray,
+        y_buf: np.ndarray,
+        drop_first: int = 1,
+        offset: int = 0,
+    ) -> int:
+        """批量读取多个 prompt 到预分配固定缓冲区中，在文件 seek 层面跳过 attention sink。
+
+        严格保证按文件物理起始位置升序单调读取，严禁任何逆向/乱序寻道。
+
+        Args:
+            prompt_indices: prompt 下标列表。
+            x_buf: 学生特征缓冲区。
+            y_buf: 教师特征缓冲区。
+            drop_first: 每个 prompt 开头跳过的 token 数（默认 1，即跳过 sink）。
+            offset: 缓冲区写入起始偏移（用于保留上一批未满 batch 的尾数）。
+
+        Returns:
+            实际写入缓冲区的 token 数量。
+        """
+        # 强制按磁盘物理起始位置升序排序，绝对杜绝逆向寻道与随机跨文件跳跃
+        p_sorted = sorted(prompt_indices, key=lambda idx: self.starts[idx])
+        cur = offset
+        for p in p_sorted:
+            L = int(self.lengths[p])
+            s = int(self.starts[p])
+            off = min(drop_first, L)
+            valid_L = L - off
+            if valid_L <= 0:
+                continue
+
+            self.f_student.seek((s + off) * self.d_in * 2)
+            self.f_student.readinto(x_buf[cur : cur + valid_L])
+
+            self.f_teacher.seek((s + off) * self.d_out * 2)
+            self.f_teacher.readinto(y_buf[cur : cur + valid_L])
+
+            cur += valid_L
+        return cur - offset
