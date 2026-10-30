@@ -65,6 +65,37 @@ class TestRidgeAccumulator:
         cos_no_drop = ridge.cosine(acc_no_drop.solve(1e2).predict(x[clean]), y[clean])
         assert cos_drop > cos_no_drop
 
+    def test_drop_first_with_merged_lengths(self):
+        """拼接传入时，每段各丢前 drop_first 行，与逐 prompt 调用等价。
+
+        这是最容易静默出错的点：合并成大块 GEMM 后，如果误把整块当成
+        一条 prompt（只丢第 0 行），sink 会漏进拟合，且没有任何报错。
+        """
+        x, y, _ = self._data(n=1200)
+        seg_len = 10
+        lengths = [seg_len] * (1200 // seg_len)
+        sink_rows = np.arange(0, 1200, seg_len)
+
+        # 逐段喂（旧调用方式）。
+        per_prompt = ridge.RidgeAccumulator(x.shape[1], y.shape[1], drop_first=1)
+        for start in range(0, 1200, seg_len):
+            per_prompt.add(x[start : start + seg_len], y[start : start + seg_len])
+        # 拼接喂（新调用方式，一次大 GEMM）。
+        merged = ridge.RidgeAccumulator(x.shape[1], y.shape[1], drop_first=1)
+        merged.add(x, y, lengths=lengths)
+
+        assert per_prompt.n == 1200 - len(sink_rows)
+        assert merged.n == per_prompt.n
+        # 两种喂法必须给出同一个解。
+        assert np.allclose(
+            merged.solve(1e2).W, per_prompt.solve(1e2).W, atol=1e-6
+        )
+        # 反例：不给 lengths 时只丢第 0 行，n 必然不同——防止有人把
+        # 「拼接但忘了 lengths」当成等价用法。
+        wrong = ridge.RidgeAccumulator(x.shape[1], y.shape[1], drop_first=1)
+        wrong.add(x, y)
+        assert wrong.n == 1200 - 1
+
     def test_standardization_moments(self):
         rng = np.random.default_rng(3)
         x = (rng.normal(size=(500, 4)) * 3 + 7).astype(np.float32)
