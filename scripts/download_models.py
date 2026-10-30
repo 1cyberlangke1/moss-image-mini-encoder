@@ -3,6 +3,9 @@
 所有版本都钉死在 commit sha 上，不用 `main`：源仓库一改，别人复现出来的
 数据集就不是同一份了。下完逐个校验 sha256，对不上就删掉重下。
 
+用自己写的分段 range 下载，不用 `hf_hub_download`：实测在该网络下
+`hf_hub` 的传输层会卡在 0 字节，而普通 range 请求能跑满带宽。
+
 用法：
     python scripts/download_models.py --dest models
     python scripts/download_models.py --dest models --teacher-from-local <本机文件>
@@ -16,43 +19,41 @@ import hashlib
 import os
 import shutil
 import sys
+import threading
+import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from huggingface_hub import hf_hub_download
+# 让 ssl 改用系统证书库：GitHub / HF 的部分接口证书链不完整，OpenSSL 不会补链。
+try:
+    import truststore
 
-# 权重来源与校验值。改这里就等于改数据集的可复现基线，必须同步更新 models/README.md。
-TEACHER = {
-    "repo": "Comfy-Org/MOSS-Image",
-    "revision": "530a4c94f92c35ef6818b1b035a983fe9dcf5f54",
-    "path": "text_encoders/qwen3.5_9b_w4a8_gptq.safetensors",
-    "dest": "qwen3.5_9b_w4a8_gptq.safetensors",
-    "bytes": 7343591088,
-    "sha256": "4cc6a1543ad2061806da46f35f90cadb4801dcba246c44782cf42ec0feb6407c",
-}
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
 
-STUDENT = {
-    "repo": "Qwen/Qwen3.5-0.8B",
-    "revision": "2fc06364715b967f1860aea9cf38778875588b17",
-    "dest_dir": "qwen3.5-0.8b",
-    "files": {
-        "config.json": None,
-        "model.safetensors-00001-of-00001.safetensors": 1746942600,
-        "model.safetensors.index.json": None,
-        "tokenizer.json": None,
-        "tokenizer_config.json": None,
-        "vocab.json": None,
-        "merges.txt": None,
-        "chat_template.jinja": None,
-        "preprocessor_config.json": None,
-        "video_preprocessor_config.json": None,
-        "LICENSE": None,
-    },
-}
+from huggingface_hub import HfApi
 
-# 分词器单独放一份，编码阶段只读这一处，避免有人换掉 student 目录时分词器跟着变。
-# 注意：这里必须用真正的 sha256。tokenizer.json 不是 LFS 文件，HF 返回的 ETag
-# 不是内容摘要，早先误把 ETag 当 sha256 记下来过，已被本值取代。
+TEACHER_REPO = "Comfy-Org/MOSS-Image"
+TEACHER_REVISION = "530a4c94f92c35ef6818b1b035a983fe9dcf5f54"
+TEACHER_PATH = "text_encoders/qwen3.5_9b_w4a8_gptq.safetensors"
+TEACHER_FILE = "qwen3.5_9b_w4a8_gptq.safetensors"
+
+STUDENT_REPO = "Qwen/Qwen3.5-0.8B"
+STUDENT_REVISION = "2fc06364715b967f1860aea9cf38778875588b17"
+STUDENT_DIR = "qwen3.5-0.8b"
+
+# tokenizer.json 单独放一份，编码阶段只读这一处。
+# 这个值是真 sha256；HF 的 ETag 只对 LFS 文件等于 sha256，早先误用过一次。
 TOKENIZER_SHA256 = "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+
+WORKERS = 4
+CHUNK = 1 << 20
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
 
 
 def sha256_file(path: Path, chunk: int = 1 << 24) -> str:
@@ -60,7 +61,7 @@ def sha256_file(path: Path, chunk: int = 1 << 24) -> str:
 
     Args:
         path: 目标文件。
-        chunk: 每次读取的字节数，默认 16 MiB。
+        chunk: 每次读取的字节数。
 
     Returns:
         小写十六进制摘要。
@@ -72,8 +73,154 @@ def sha256_file(path: Path, chunk: int = 1 << 24) -> str:
     return digest.hexdigest()
 
 
-def log(message: str) -> None:
-    print(message, flush=True)
+def resolve_url(repo: str, path: str, revision: str) -> str:
+    """拼出 Hugging Face 的直链。
+
+    Args:
+        repo: 仓库 id。
+        path: 仓库内路径。
+        revision: commit sha。
+
+    Returns:
+        `https://huggingface.co/<repo>/resolve/<revision>/<path>`。
+    """
+    return f"https://huggingface.co/{repo}/resolve/{revision}/{quote(path)}"
+
+
+def quote(path: str) -> str:
+    """对路径做 URL 编码，保留斜杠。
+
+    Args:
+        path: 仓库内相对路径。
+
+    Returns:
+        编码后的路径。
+    """
+    import urllib.parse
+
+    return urllib.parse.quote(path)
+
+
+def _fetch(url: str, start: int, end: int, retries: int = 5) -> bytes:
+    """下载一个字节区间，失败重试。
+
+    Args:
+        url: 直链。
+        start: 起始字节（含）。
+        end: 结束字节（含）。
+        retries: 重试次数。
+
+    Returns:
+        该区间的字节内容。
+    """
+    last: Exception | None = None
+    for attempt in range(retries):
+        try:
+            request = urllib.request.Request(url)
+            request.add_header("Range", f"bytes={start}-{end}")
+            with urllib.request.urlopen(request, timeout=120) as response:
+                data = response.read()
+            if len(data) != end - start + 1:
+                raise IOError(f"区间长度不符：期望 {end - start + 1}，收到 {len(data)}")
+            return data
+        except Exception as error:  # noqa: BLE001 - 网络异常的形态太多，统一重试
+            last = error
+            time.sleep(min(2**attempt, 20))
+    raise SystemExit(f"下载失败 {url} [{start}-{end}]：{last}")
+
+
+def download(url: str, dest: Path, size: int, workers: int = WORKERS) -> None:
+    """分段并行下载一个文件。
+
+    Args:
+        url: 直链。
+        dest: 落地路径。
+        size: 期望字节数，用于切分区间与校验。
+        workers: 并行段数。
+
+    Returns:
+        无。失败时抛 SystemExit。
+
+    Notes:
+        每段直接写进预分配好的文件的不同偏移，不产生额外临时文件。
+        断点续传没做：当前网络下单文件十几分钟，重试整段比处理半截文件简单。
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_suffix(dest.suffix + ".part")
+    with part.open("wb") as handle:
+        handle.truncate(size)
+
+    step = (size + workers - 1) // workers
+    ranges = [(i * step, min(size, (i + 1) * step) - 1) for i in range(workers)]
+    done = [0] * workers
+    lock = threading.Lock()
+    started = time.time()
+    stop = threading.Event()
+
+    def report() -> None:
+        while not stop.wait(2.0):
+            total = sum(done)
+            elapsed = max(1e-6, time.time() - started)
+            percent = 100.0 * total / size
+            rate = total / 1e6 / elapsed
+            print(
+                f"\r    {percent:5.1f}%  {total / 1e6:7.1f}/{size / 1e6:.1f} MB  "
+                f"{rate:5.2f} MB/s",
+                end="",
+                flush=True,
+            )
+
+    def worker(index: int) -> None:
+        start, end = ranges[index]
+        with part.open("r+b") as handle:
+            cursor = start
+            while cursor <= end:
+                block_end = min(end, cursor + CHUNK - 1)
+                data = _fetch(url, cursor, block_end)
+                handle.seek(cursor)
+                handle.write(data)
+                cursor = block_end + 1
+                with lock:
+                    done[index] += len(data)
+
+    reporter = threading.Thread(target=report, daemon=True)
+    reporter.start()
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for future in [pool.submit(worker, i) for i in range(workers)]:
+                future.result()
+    finally:
+        stop.set()
+        reporter.join(timeout=1)
+    print()
+
+    if part.stat().st_size != size:
+        part.unlink(missing_ok=True)
+        raise SystemExit(f"下载后大小不符：{part.stat().st_size} != {size}")
+    part.replace(dest)
+    elapsed = time.time() - started
+    log(f"    完成 {size / 1e6:.1f} MB，{elapsed:.0f}s，{size / 1e6 / elapsed:.2f} MB/s")
+
+
+def file_meta(repo: str, revision: str) -> dict[str, tuple[int, str | None]]:
+    """取仓库在指定 revision 下每个文件的字节数与 LFS sha256。
+
+    Args:
+        repo: 仓库 id。
+        revision: commit sha。
+
+    Returns:
+        路径 -> (字节数, sha256 或 None)。非 LFS 文件没有 sha256。
+
+    Notes:
+        走 API 只读元信息，不下载内容。
+    """
+    api = HfApi()
+    info = api.model_info(repo_id=repo, revision=revision, files_metadata=True)
+    return {
+        sibling.rfilename: (sibling.size or 0, (sibling.lfs or {}).get("sha256"))
+        for sibling in (info.siblings or [])
+    }
 
 
 def place_teacher(dest_dir: Path, local: Path | None) -> Path:
@@ -86,19 +233,22 @@ def place_teacher(dest_dir: Path, local: Path | None) -> Path:
     Returns:
         落位后的路径。sha256 不匹配时抛 SystemExit。
     """
-    target = dest_dir / TEACHER["dest"]
+    target = dest_dir / TEACHER_FILE
+    meta = file_meta(TEACHER_REPO, TEACHER_REVISION).get(TEACHER_PATH)
+    if meta is None:
+        raise SystemExit(f"仓库里找不到 {TEACHER_PATH}")
+    size, sha = meta
+    if sha is None:
+        raise SystemExit("teacher 应该是 LFS 文件，但没取到 sha256")
 
     if local is not None:
         if not local.is_file():
             raise SystemExit(f"本机 teacher 文件不存在：{local}")
-        size = local.stat().st_size
-        if size != TEACHER["bytes"]:
-            raise SystemExit(
-                f"本机 teacher 字节数不符：期望 {TEACHER['bytes']}，实际 {size}"
-            )
+        if local.stat().st_size != size:
+            raise SystemExit(f"本机 teacher 字节数不符：期望 {size}，实际 {local.stat().st_size}")
         log(f"校验本机 teacher sha256（{size / 1024**3:.2f} GiB，约需一分钟）…")
         got = sha256_file(local)
-        if got != TEACHER["sha256"]:
+        if got != sha:
             raise SystemExit(f"本机 teacher sha256 不符：{got}")
         log("  sha256 一致")
         if target.exists():
@@ -112,26 +262,18 @@ def place_teacher(dest_dir: Path, local: Path | None) -> Path:
             log(f"  跨卷，已复制：{target}")
         return target
 
-    if target.is_file() and target.stat().st_size == TEACHER["bytes"]:
-        log(f"teacher 已存在，校验 sha256…")
-        if sha256_file(target) == TEACHER["sha256"]:
+    if target.is_file() and target.stat().st_size == size:
+        log("teacher 已存在，校验 sha256…")
+        if sha256_file(target) == sha:
             log("  sha256 一致，跳过下载")
             return target
         log("  sha256 不符，重新下载")
         target.unlink()
 
-    log(f"下载 teacher：{TEACHER['repo']}@{TEACHER['revision'][:12]}")
-    cached = hf_hub_download(
-        repo_id=TEACHER["repo"],
-        filename=TEACHER["path"],
-        revision=TEACHER["revision"],
-        local_dir=str(dest_dir),
-    )
-    downloaded = Path(cached)
-    if downloaded != target and downloaded.is_file():
-        shutil.move(str(downloaded), target)
+    log(f"下载 teacher：{TEACHER_REPO}@{TEACHER_REVISION[:12]}")
+    download(resolve_url(TEACHER_REPO, TEACHER_PATH, TEACHER_REVISION), target, size)
     log("  校验 sha256…")
-    if sha256_file(target) != TEACHER["sha256"]:
+    if sha256_file(target) != sha:
         target.unlink(missing_ok=True)
         raise SystemExit("teacher sha256 不符，已删除，请重试")
     log("  sha256 一致")
@@ -139,7 +281,7 @@ def place_teacher(dest_dir: Path, local: Path | None) -> Path:
 
 
 def fetch_student(dest_dir: Path) -> Path:
-    """下载 Qwen3.5-0.8B 全部需要的文件。
+    """下载 Qwen3.5-0.8B 的全部文件。
 
     Args:
         dest_dir: models/ 目录。
@@ -147,26 +289,23 @@ def fetch_student(dest_dir: Path) -> Path:
     Returns:
         student 目录路径。
     """
-    target_dir = dest_dir / STUDENT["dest_dir"]
-    target_dir.mkdir(parents=True, exist_ok=True)
-    for name, expected_bytes in STUDENT["files"].items():
-        out = target_dir / name
-        if out.is_file() and (
-            expected_bytes is None or out.stat().st_size == expected_bytes
-        ):
+    target_dir = dest_dir / STUDENT_DIR
+    meta = file_meta(STUDENT_REPO, STUDENT_REVISION)
+    if not meta:
+        raise SystemExit("student 仓库元信息为空")
+    for name in sorted(meta):
+        size, sha = meta[name]
+        if name.startswith(".") or size == 0:
             continue
-        log(f"下载 student：{name}")
-        # local_dir 直接落到 models/，不走「缓存再复制」：省一次 1.75 GB 的拷贝。
-        hf_hub_download(
-            repo_id=STUDENT["repo"],
-            filename=name,
-            revision=STUDENT["revision"],
-            local_dir=str(target_dir),
-        )
-        if not out.is_file():
-            raise SystemExit(f"下载后找不到 {out}")
-        if expected_bytes is not None and out.stat().st_size != expected_bytes:
-            raise SystemExit(f"{name} 字节数不符，期望 {expected_bytes}")
+        out = target_dir / name
+        if out.is_file() and out.stat().st_size == size:
+            if sha is None or sha256_file(out) == sha:
+                continue
+        log(f"下载 student：{name}  ({size / 1e6:.1f} MB)")
+        download(resolve_url(STUDENT_REPO, name, STUDENT_REVISION), out, size)
+        if sha is not None and sha256_file(out) != sha:
+            out.unlink(missing_ok=True)
+            raise SystemExit(f"{name} sha256 不符，已删除")
     return target_dir
 
 
@@ -186,7 +325,8 @@ def place_tokenizer(student_dir: Path, dest_dir: Path) -> Path:
     source = student_dir / "tokenizer.json"
     if not source.is_file():
         raise SystemExit(f"student 目录里没有 tokenizer.json：{source}")
-    shutil.copy2(source, target)
+    if not target.is_file() or sha256_file(target) != TOKENIZER_SHA256:
+        shutil.copy2(source, target)
     got = sha256_file(target)
     if got != TOKENIZER_SHA256:
         raise SystemExit(f"tokenizer.json sha256 不符：{got}")
@@ -204,20 +344,19 @@ def check(dest_dir: Path) -> int:
         进程退出码，0 表示全部通过。
     """
     ok = True
-    teacher = dest_dir / TEACHER["dest"]
+    teacher = dest_dir / TEACHER_FILE
+    expectation = file_meta(TEACHER_REPO, TEACHER_REVISION).get(TEACHER_PATH)
     if not teacher.is_file():
         log(f"缺失 teacher：{teacher}")
         ok = False
-    elif teacher.stat().st_size != TEACHER["bytes"]:
+    elif expectation and teacher.stat().st_size != expectation[0]:
         log(f"teacher 字节数不符：{teacher.stat().st_size}")
         ok = False
+    elif expectation and expectation[1] and sha256_file(teacher) != expectation[1]:
+        log("teacher sha256 不符")
+        ok = False
     else:
-        log("teacher 字节数一致，校验 sha256…")
-        if sha256_file(teacher) != TEACHER["sha256"]:
-            log("  sha256 不符")
-            ok = False
-        else:
-            log("  sha256 一致")
+        log("teacher 校验通过")
 
     tokenizer = dest_dir / "tokenizer" / "tokenizer.json"
     if not tokenizer.is_file():
@@ -227,10 +366,15 @@ def check(dest_dir: Path) -> int:
         log("分词器 sha256 不符")
         ok = False
     else:
-        log("分词器 sha256 一致")
+        log("分词器校验通过")
 
-    student_dir = dest_dir / STUDENT["dest_dir"]
-    missing = [n for n in STUDENT["files"] if not (student_dir / n).is_file()]
+    student_meta = file_meta(STUDENT_REPO, STUDENT_REVISION)
+    missing = [
+        name
+        for name, (size, _) in student_meta.items()
+        if not name.startswith(".") and size > 0
+        and not (dest_dir / STUDENT_DIR / name).is_file()
+    ]
     if missing:
         log(f"缺失 student 文件：{missing}")
         ok = False
@@ -259,7 +403,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.check:
         return check(dest)
 
-    student_dir = dest / STUDENT["dest_dir"]
+    student_dir = dest / STUDENT_DIR
     if not args.skip_teacher:
         place_teacher(dest, args.teacher_from_local)
     if not args.skip_student:
