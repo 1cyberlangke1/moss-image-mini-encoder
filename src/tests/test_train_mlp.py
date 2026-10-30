@@ -203,3 +203,119 @@ class TestSave:
             assert handle.get_tensor("std_out").dtype == torch.float32
             assert any(k.startswith("mlp.") for k in keys)
         assert out.with_suffix(".json").is_file()
+
+
+def test_save_linear(tmp_path):
+    """测试纯线性 Ridge 适配器导出。"""
+    from moss_small_encoder.train.mlp import save_linear
+    from moss_small_encoder.train.ridge import RidgeSolution
+    import torch
+    from safetensors import safe_open
+
+    sol = RidgeSolution(
+        W=np.zeros((1024, 4096), dtype=np.float32),
+        mean_in=np.zeros(1024, dtype=np.float32),
+        std_in=np.ones(1024, dtype=np.float32),
+        mean_out=np.zeros(4096, dtype=np.float32),
+        std_out=np.ones(4096, dtype=np.float32),
+        lam=100.0,
+        n_tokens=1000,
+    )
+    out = tmp_path / "linear.safetensors"
+    save_linear(out, sol, meta={"val_cosine": "0.75"})
+    assert out.is_file()
+    with safe_open(str(out), framework="pt") as handle:
+        assert set(handle.keys()) == {"weight", "mean_in", "std_in", "mean_out", "std_out"}
+        assert handle.get_tensor("weight").shape == (1024, 4096)
+        assert handle.get_tensor("weight").dtype == torch.float16
+        assert handle.metadata()["format"] == "potatoforge_moss_encoder_projection_v1"
+        assert handle.metadata()["val_cosine"] == "0.75"
+
+
+def test_default_config_does_not_write_checkpoints():
+    """默认配置不能把检查点写进仓库目录。
+
+    输入: 无，只读 MLPConfig 的默认值。
+    输出: 无。
+    预期: checkpoint_dir 为 None；因此直接调 mlp.train() 不会落地检查点，
+          否则跑一次单测就会在仓库里留下 output/checkpoints/。
+          命令行入口 run.py 自己显式给目录，不受影响。
+    """
+    assert mlp.MLPConfig().checkpoint_dir is None
+
+
+def test_checkpoint_manager_rotating(tmp_path):
+    """测试按步数间隔保存和只保留最近 N 个检查点。"""
+    from moss_small_encoder.train.mlp import CheckpointManager
+    import torch
+
+    ckpt_dir = tmp_path / "checkpoints"
+    mgr = CheckpointManager(ckpt_dir, save_every_steps=10, keep_last=2)
+
+    assert not mgr.should_save(5)
+    assert mgr.should_save(10)
+    assert mgr.should_save(20)
+
+    net = torch.nn.Linear(10, 10)
+    opt = torch.optim.Adam(net.parameters())
+
+    # 保存第 10 步
+    p1 = mgr.save(10, 0, net, opt, None)
+    assert p1.is_file()
+    assert (ckpt_dir / "checkpoint_latest.pt").is_file()
+
+    # 保存第 20 步
+    p2 = mgr.save(20, 0, net, opt, None)
+    assert p1.is_file()
+    assert p2.is_file()
+
+    # 保存第 30 步（此时应删除 p1，只保留 p2 和 p3）
+    p3 = mgr.save(30, 1, net, opt, None)
+    assert not p1.exists()
+    assert p2.is_file()
+    assert p3.is_file()
+
+    # 保存最佳检查点
+    p_best = mgr.save_best(30, 1, net, 0.85, 0.85)
+    assert p_best.is_file()
+
+
+def test_stream_reader_train_batch_alignment(tmp_path):
+    """测试真流式读取下多 batch 结转对齐与验证集分批评估。"""
+    from moss_small_encoder.train.store import FeatureWriter, StreamReader
+
+    d_in = 8
+    d_out = 4
+    rng = np.random.default_rng(42)
+
+    with FeatureWriter(tmp_path, d_in=d_in, d_out=d_out) as writer:
+        for i in range(50):
+            length = int(rng.integers(10, 30))
+            x = rng.normal(size=(length, d_in)).astype(np.float16)
+            y = (x @ rng.normal(size=(d_in, d_out))).astype(np.float16)
+            writer.add(f"p{i:03d}", x, y)
+
+    reader = StreamReader(tmp_path)
+    sol = ridge.RidgeAccumulator(d_in, d_out, drop_first=1)
+    x_buf = np.empty((200, d_in), dtype=np.float16)
+    y_buf = np.empty((200, d_out), dtype=np.float16)
+    n = reader.read_chunk_into([0, 1, 2], x_buf, y_buf, drop_first=1)
+    sol.add(x_buf[:n], y_buf[:n])
+    solution = sol.solve(1e3)
+
+    logs: list[str] = []
+    config = mlp.MLPConfig(
+        hidden=16,
+        depth=1,
+        epochs=2,
+        batch=32,
+        eval_tokens=50,
+        compile=False,
+    )
+    result = mlp.train(reader, solution, config, device="cpu", log=logs.append)
+    assert result.epochs_run == 2
+    assert len(result.history) == 2
+    assert any("[Eval]" in line for line in logs)
+    reader.close()
+
+

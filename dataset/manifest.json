@@ -1,0 +1,155 @@
+{
+  "seed": 20261027,
+  "max_tokens": 4096,
+  "splits": {
+    "train": 0.7,
+    "val": 0.15,
+    "test": 0.15
+  },
+  "buckets": [
+    {
+      "name": "official",
+      "kind": "official",
+      "source": "moss_official",
+      "quota": 40,
+      "forced_split": "test"
+    },
+    {
+      "name": "layout",
+      "kind": "synth",
+      "source": null,
+      "quota": 3000,
+      "forced_split": null
+    },
+    {
+      "name": "en_tag",
+      "kind": "stream",
+      "source": "jtatman",
+      "quota": 12000,
+      "forced_split": null
+    },
+    {
+      "name": "en_prose",
+      "kind": "stream",
+      "source": "gustavosta",
+      "quota": 8000,
+      "forced_split": null
+    },
+    {
+      "name": "zh_prose",
+      "kind": "stream",
+      "source": "shuixian",
+      "quota": 4000,
+      "forced_split": null
+    },
+    {
+      "name": "zh_extra",
+      "kind": "stream",
+      "source": "goku",
+      "quota": 8000,
+      "forced_split": null
+    },
+    {
+      "name": "zh_tag",
+      "kind": "tag_compose",
+      "source": "n714",
+      "quota": 4000,
+      "forced_split": null
+    },
+    {
+      "name": "negative",
+      "kind": "stream",
+      "source": "jtatman",
+      "quota": 800,
+      "forced_split": null
+    }
+  ],
+  "source_revisions": {
+    "jtatman": "eeddd630cca52dbb9af5a4a40aa5748b565da36e",
+    "gustavosta": "d816d4a05cb89bde39dd99284c459801e1e7e69a",
+    "shuixian": "4b1500b6d15203f8c7b8853f2fff48e4758ab706",
+    "goku": "5d347be762f9c8dc5bd0eaffb05778e47551855f",
+    "n714": "31199613c8ed198eb6fa74b20cc63725d568e62f",
+    "moss_official": "a211e398a33cbf4dd7a1cc52aba0dfdbac3b0281",
+    "synth_layout": "n/a"
+  },
+  "rows": 38496,
+  "tokens": 6374951,
+  "per_bucket": {
+    "official": {
+      "read": 20,
+      "candidates": 20,
+      "kept": 20
+    },
+    "layout": {
+      "read": 3000,
+      "candidates": 3000,
+      "kept": 3000
+    },
+    "en_tag": {
+      "read": 40874,
+      "candidates": 37090,
+      "drop:empty": 19,
+      "drop:duplicate": 3559,
+      "drop:too_short": 206,
+      "over_quota": 25090,
+      "kept": 12000
+    },
+    "en_prose": {
+      "read": 73718,
+      "candidates": 61589,
+      "drop:duplicate": 12120,
+      "drop:too_short": 9,
+      "over_quota": 53589,
+      "kept": 8000
+    },
+    "zh_prose": {
+      "read": 5430,
+      "candidates": 5196,
+      "drop:edit_instruction": 22,
+      "drop:too_short": 81,
+      "drop:duplicate": 131,
+      "over_quota": 1196,
+      "kept": 4000
+    },
+    "zh_extra": {
+      "read": 7561,
+      "candidates": 6676,
+      "drop:not_zh": 222,
+      "drop:edit_instruction": 56,
+      "drop:duplicate": 188,
+      "drop:too_short": 418,
+      "drop:over_max_tokens": 1,
+      "kept": 6676
+    },
+    "zh_tag": {
+      "read": 4000,
+      "candidates": 4000,
+      "kept": 4000
+    },
+    "negative": {
+      "read": 14098,
+      "candidates": 5129,
+      "drop:duplicate": 8779,
+      "drop:too_short": 188,
+      "over_quota": 4329,
+      "drop:too_long_chars": 2,
+      "kept": 800
+    }
+  },
+  "packages": {
+    "python": "3.11.9",
+    "huggingface-hub": "2.3.0",
+    "tokenizers": "0.23.3",
+    "pyarrow": "26.0.0",
+    "numpy": "2.4.6",
+    "pyyaml": "6.0.3"
+  },
+  "output": {
+    "prompts.jsonl": {
+      "sha256": "4ae7b9e6d5eafa78cf313f34c9689fb03aa34ae9700b23c1c6b590d3bd8d5185",
+      "bytes": 36028615
+    }
+  },
+  "elapsed_seconds": 670.9
+}
