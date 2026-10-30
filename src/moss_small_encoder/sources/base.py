@@ -33,7 +33,7 @@ try:
 except ImportError:  # 没装也能跑，只是 GitHub 那两个源可能连不上
     pass
 
-_USER_AGENT = "mini-moss-image-smaller-encoder/0.1"
+_USER_AGENT = "moss-image-mini-encoder/0.1"
 _FS: HfFileSystem | None = None
 
 
