@@ -89,3 +89,91 @@ def test_iter_records_rejects_empty_vocab(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError):
         list(danbooru.iter_records(path, count=1, attr_dir=None))
+
+
+class TestDownloadPaging:
+    """分页硬限制的回归测试：不空转、不跳过、不重复写喵。"""
+
+    @staticmethod
+    def _row(tid: int) -> dict:
+        """造一条 tag 记录喵。"""
+        return {
+            "id": tid,
+            "name": f"tag_{tid}",
+            "post_count": 1,
+            "category": 0,
+            "is_deprecated": False,
+        }
+
+    def test_last_page_bisects_instead_of_walking(self, monkeypatch, tmp_path):
+        """区间共 7 页时，二分应直接定位到 7，而不是逐页翻喵。"""
+        calls: list[int] = []
+
+        def fake(session, page, lo=0, hi=0):
+            calls.append(page)
+            return [self._row(page)] if page <= 7 else []
+
+        monkeypatch.setattr(danbooru, "_fetch_page", fake)
+        assert danbooru._last_page(None, 0, 1000) == 7
+        assert len(calls) < 20
+
+    def test_empty_range_returns_zero(self, monkeypatch):
+        """区间为空时页数为 0，不发起后续请求喵。"""
+        monkeypatch.setattr(danbooru, "_fetch_page", lambda *a, **k: [])
+        assert danbooru._last_page(None, 0, 1000) == 0
+
+    def test_download_writes_all_and_does_not_overfetch(self, monkeypatch, tmp_path):
+        """3 页区间只写 3 条，且总请求次数远小于逐页翻到底喵。"""
+        calls: list[int] = []
+
+        def fake(session, page, lo=0, hi=0):
+            calls.append(page)
+            if page <= 3:
+                return [self._row(page)]
+            return []
+
+        monkeypatch.setattr(danbooru, "_fetch_page", fake)
+        monkeypatch.setattr(danbooru, "_opener", lambda proxy: None)
+
+        out = tmp_path / "tags.jsonl"
+        n = danbooru.download_tags(
+            out, proxy="", ranges=[(0, 1000)], sleep=0, report_every=0
+        )
+
+        assert n == 3
+        assert len(calls) < 40
+        assert len(out.read_text(encoding="utf-8").splitlines()) == 3
+
+    def test_download_raises_instead_of_skipping_a_page(self, monkeypatch, tmp_path):
+        """某页连续失败必须抛错，绝不静默跳过喵。"""
+        def fake(session, page, lo=0, hi=0):
+            if page == 2:
+                raise OSError("boom")
+            return [self._row(page)] if page <= 3 else []
+
+        monkeypatch.setattr(danbooru, "_fetch_page", fake)
+        monkeypatch.setattr(danbooru, "_opener", lambda proxy: None)
+        monkeypatch.setattr(danbooru.time, "sleep", lambda _: None)
+
+        with pytest.raises(RuntimeError):
+            danbooru.download_tags(
+                tmp_path / "tags.jsonl", proxy="", ranges=[(0, 1000)],
+                sleep=0, report_every=0, retries=2,
+            )
+
+    def test_rerun_skips_existing_ids(self, monkeypatch, tmp_path):
+        """重跑时已存在的 id 不重复写喵。"""
+        def fake(session, page, lo=0, hi=0):
+            return [self._row(page)] if page <= 3 else []
+
+        monkeypatch.setattr(danbooru, "_fetch_page", fake)
+        monkeypatch.setattr(danbooru, "_opener", lambda proxy: None)
+
+        out = tmp_path / "tags.jsonl"
+        first = danbooru.download_tags(out, proxy="", ranges=[(0, 1000)],
+                                       sleep=0, report_every=0)
+        second = danbooru.download_tags(out, proxy="", ranges=[(0, 1000)],
+                                        sleep=0, report_every=0)
+
+        assert first == second == 3
+        assert len(out.read_text(encoding="utf-8").splitlines()) == 3

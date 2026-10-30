@@ -115,7 +115,139 @@ LIMIT {limit} OFFSET {offset}
 """
 
 
-def already_done(path: Path) -> set[str]:
+QID_STEP = 5_000_000
+LABEL_BATCH = 400
+# 连续这么多片为空就认为扫到底了：QID 上限不写死，避免硬编码到 1.5 亿后漏掉尾部喵
+MAX_EMPTY_SLICES = 3
+ID_CACHE = Path("dataset/wikidata/enterprise_ids.jsonl")
+
+
+def fetch_qids(
+    session: urllib.request.OpenerDirector,
+    type_qid: str,
+    min_sitelinks: int,
+    retries: int = 12,
+    cache: Path | None = None,
+    max_empty: int = MAX_EMPTY_SLICES,
+) -> list[tuple[str, int]]:
+    """按 QID 区间分片，只取 `(qid, sitelinks)`，不带名字喵。
+
+    输入: session、type_qid、min_sitelinks 下限、retries、
+          cache 缓存文件（存在就直接读，不重扫）、
+          max_empty 连续多少片为空就停
+    输出: [(qid, sitelinks), ...]
+    预期: 不写死上限，扫到连续空片为止；失败重试不跳过喵
+
+    Notes:
+        两个设计点都是给「永远 20 分钟」这个问题修的喵：
+        1. 上限不硬编码成 1.5 亿，改成连续空片判定；
+        2. 结果落盘，补缺口时直接读缓存，不再重扫 30 片喵。
+
+        为什么不带 label：`ORDER BY` + `OPTIONAL rdfs:label` 会把 WDQS 压到
+        504（实测企业类必崩）。拆成两步后，这一步只做带索引的 P31 扫描喵。
+    """
+    if cache is not None and cache.is_file():
+        cached: list[tuple[str, int]] = []
+        with cache.open("r", encoding="utf-8") as fp:
+            for line in fp:
+                row = json.loads(line)
+                cached.append((row["qid"], row["sitelinks"]))
+        print(f"  读到 ID 缓存 {len(cached):,} 个 -> {cache}", flush=True)
+        return cached
+
+    floor = f"FILTER(?n >= {min_sitelinks})" if min_sitelinks else ""
+    found: list[tuple[str, int]] = []
+    empty_streak = 0
+    lo = 0
+    while empty_streak < max_empty:
+        hi = lo + QID_STEP
+        query = f"""
+SELECT ?item ?n WHERE {{
+  ?item wdt:P31 wd:{type_qid} .
+  ?item wikibase:sitelinks ?n .
+  {floor}
+  BIND(xsd:integer(STRAFTER(STR(?item), "entity/Q")) AS ?qid)
+  FILTER(?qid >= {lo} && ?qid < {hi})
+}}
+"""
+        rows = None
+        for attempt in range(1, retries + 1):
+            try:
+                rows = sparql(session, query, timeout=180)
+                break
+            except Exception as exc:
+                wait = min(5 * attempt, 60)
+                print(f"  [QID {lo:,}-{hi:,}] 第 {attempt} 次失败 "
+                      f"{type(exc).__name__} {getattr(exc, 'code', '')}，等 {wait}s",
+                      flush=True)
+                time.sleep(wait)
+        if rows is None:
+            raise RuntimeError(
+                f"{type_qid} 的 QID {lo}-{hi} 连续 {retries} 次失败；已拿到 {len(found)} 条"
+            )
+        for row in rows:
+            found.append((row["item"].rsplit("/", 1)[-1], int(row["n"])))
+        if rows:
+            empty_streak = 0
+            print(f"  [QID {lo:,}-{hi:,}] +{len(rows)} 累计 {len(found):,}", flush=True)
+        else:
+            empty_streak += 1
+            print(f"  [QID {lo:,}-{hi:,}] 空片 {empty_streak}/{max_empty}", flush=True)
+        lo += QID_STEP
+
+    if cache is not None:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        with cache.open("w", encoding="utf-8") as fp:
+            for qid, sits in found:
+                fp.write(json.dumps({"qid": qid, "sitelinks": sits}) + "\n")
+        print(f"  ID 缓存已落盘 {len(found):,} 个 -> {cache}", flush=True)
+    return found
+
+
+def fetch_labels(
+    session: urllib.request.OpenerDirector,
+    qids: list[str],
+    retries: int = 12,
+) -> dict[str, str]:
+    """用 VALUES 批量取名字，中文优先、英文兜底，最后转简体喵。
+
+    输入: session、qids
+    输出: {qid: name}，取不到的被略过
+    预期: 每批 LABEL_BATCH 个，失败重试不跳过
+    """
+    names: dict[str, str] = {}
+    for start in range(0, len(qids), LABEL_BATCH):
+        batch = qids[start:start + LABEL_BATCH]
+        values = " ".join(f"wd:{qid}" for qid in batch)
+        query = f"""
+SELECT ?item ?zh ?en WHERE {{
+  VALUES ?item {{ {values} }}
+  OPTIONAL {{ ?item rdfs:label ?zh FILTER(LANG(?zh) = "zh") }}
+  OPTIONAL {{ ?item rdfs:label ?en FILTER(LANG(?en) = "en") }}
+}}
+"""
+        rows = None
+        for attempt in range(1, retries + 1):
+            try:
+                rows = sparql(session, query, timeout=180)
+                break
+            except Exception as exc:
+                wait = min(5 * attempt, 60)
+                print(f"  [label {start}-{start + len(batch)}] 第 {attempt} 次失败 "
+                      f"{type(exc).__name__} {getattr(exc, 'code', '')}，等 {wait}s",
+                      flush=True)
+                time.sleep(wait)
+        if rows is None:
+            raise RuntimeError(f"label 批次 {start} 连续 {retries} 次失败")
+        for row in rows:
+            qid = row["item"].rsplit("/", 1)[-1]
+            name = row.get("zh") or row.get("en") or ""
+            name = _to_simplified(name.strip())
+            if name and name != qid:
+                names[qid] = name
+        if (start // LABEL_BATCH) % 20 == 0:
+            print(f"  label 进度 {start + len(batch):,}/{len(qids):,}", flush=True)
+    return names
     """读出已抓到的 QID 集合，用于断点续抓喵。"""
     done: set[str] = set()
     if not path.exists():
@@ -127,6 +259,45 @@ def already_done(path: Path) -> set[str]:
             except Exception:
                 continue
     return done
+
+
+def count_entities(
+    session: urllib.request.OpenerDirector,
+    type_qid: str,
+    min_sitelinks: int = 0,
+    retries: int = 6,
+) -> int:
+    """数某类型下带中/英文标签的唯一实体数喵。
+
+    输入: session、type_qid、min_sitelinks 门槛、retries
+    输出: 唯一实体数
+    预期: 与抓取口径一致（同一 P31、同一 sitelinks 门槛、同样只算有名字的）
+
+    Notes:
+        **必须用 `COUNT(DISTINCT ?item)`**。一个实体同时有 zh 和 en 两个标签时，
+        `COUNT(?item)` 会把它数两次——实测重复系数 1.210，
+        把 106,909 数成了 126,918，直接导致我凭空造出两万条的缺口喵。
+    """
+    floor = f"FILTER(?n >= {min_sitelinks})" if min_sitelinks else ""
+    query = f"""
+SELECT (COUNT(DISTINCT ?item) AS ?c) WHERE {{
+  ?item wdt:P31 wd:{type_qid} .
+  ?item wikibase:sitelinks ?n .
+  {floor}
+  ?item rdfs:label ?x . FILTER(LANG(?x) IN ("zh", "en"))
+}}
+"""
+    for attempt in range(1, retries + 1):
+        try:
+            rows = sparql(session, query, timeout=300)
+            return int(rows[0]["c"])
+        except Exception as exc:
+            wait = min(10 * attempt, 60)
+            print(f"  [count {type_qid}] 第 {attempt} 次失败 "
+                  f"{type(exc).__name__} {getattr(exc, 'code', '')}，等 {wait}s",
+                  flush=True)
+            time.sleep(wait)
+    raise RuntimeError(f"{type_qid} 的 COUNT(DISTINCT) 连续 {retries} 次失败")
 
 
 def fetch_type(
@@ -144,20 +315,27 @@ def fetch_type(
     """
     added = 0
     offset = 0
+    page_size = PAGE_OVERRIDE.get(type_qid, PAGE)
     while True:
         rows = None
         for attempt in range(1, retries + 1):
             try:
-                rows = sparql(session, page_query(type_qid, offset, PAGE_OVERRIDE.get(type_qid, PAGE)))
+                rows = sparql(session, page_query(type_qid, offset, page_size))
                 break
             except Exception as exc:
                 detail = getattr(exc, "code", "")
+                # 间隔递增：504 是服务端算太久，连着重试只会继续打它喵
+                wait = min(5 * attempt, 60)
                 print(f"  [{type_qid} offset={offset}] 第 {attempt} 次失败 "
-                      f"{type(exc).__name__} {detail}", flush=True)
-                time.sleep(3)
+                      f"{type(exc).__name__} {detail}，等 {wait}s", flush=True)
+                time.sleep(wait)
         if rows is None:
-            print(f"  [{type_qid} offset={offset}] 放弃该页", flush=True)
-            break
+            # 绝不静默跳过：跳过一页就等于永久丢掉那 5000 条，
+            # 而且 OFFSET 分页跳过后无法事后定位漏了哪些喵
+            raise RuntimeError(
+                f"{type_qid} offset={offset} 连续 {retries} 次失败，"
+                f"已抓 {added} 条；修复网络后重跑会按已抓 QID 续上喵"
+            )
         if not rows:
             break
         for row in rows:
@@ -178,7 +356,7 @@ def fetch_type(
             }, ensure_ascii=False) + "\n")
             added += 1
         sink.flush()
-        offset += PAGE_OVERRIDE.get(type_qid, PAGE)
+        offset += page_size
         print(f"  {ROOT_TYPES.get(type_qid, type_qid)} offset={offset} "
               f"+{len(rows)} 累计新增 {added:,}", flush=True)
     return added

@@ -25,6 +25,48 @@ from .base import Record
 
 API = "https://danbooru.donmai.us/tags.json"
 PAGE_LIMIT = 1000
+# page >= 1001 会返回 410 Gone；实测 page=1000 已经会 500，
+# 所以单段 id 范围必须明显小于 100 万条，取 50 万喵
+MAX_PAGES = 1000
+ID_STEP = 500_000
+
+
+def _max_id(session: urllib.request.OpenerDirector, retries: int = 8) -> int:
+    """探测当前最大的 tag id，不写死上限喵。
+
+    输入: session；retries 重试次数
+    输出: 最大 id（探测失败抛错）
+    预期: 用 `search[id]=>0` + `search[order]=id` 取降序第一条
+
+    Notes:
+        之前 `DEFAULT_RANGES` 写死到 300 万，只要 tag 继续增长，尾部就永远漏；
+        这里改成每次运行先问服务端当前最大 id 是多少喵。
+    """
+    params = {"limit": 1, "search[id]": ">0", "search[order]": "id"}
+    url = f"{API}?{urllib.parse.urlencode(params)}"
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with session.open(req, timeout=60) as resp:
+                rows = json.loads(resp.read().decode("utf-8"))
+            if rows:
+                return int(rows[0]["id"])
+        except OSError as exc:
+            wait = min(5 * attempt, 60)
+            print(f"  [探测最大 id] 第 {attempt} 次失败 {type(exc).__name__}，等 {wait}s",
+                  flush=True)
+            time.sleep(wait)
+    raise RuntimeError("探测 Danbooru 最大 tag id 失败")
+
+
+def id_ranges(top: int, step: int = ID_STEP) -> list[tuple[int, int]]:
+    """按最大 id 切出覆盖全库的区间列表喵。
+
+    输入: top 最大 id；step 单段宽度
+    输出: [(lo, hi), ...]，末段右端覆盖 top
+    预期: 段数随 top 增长自动增加，不存在写死的上限喵
+    """
+    return [(lo, min(lo + step, top + 1)) for lo in range(0, top + 1, step)]
 USER_AGENT = "moss-image-mini-encoder/0.1"
 
 # 角色名后面的槽位：**一个外观词都没有**喵。
@@ -55,58 +97,137 @@ def _opener(proxy: str) -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(*handlers)
 
 
-def _fetch_page(session: urllib.request.OpenerDirector, page: int) -> list[dict]:
-    """取第 page 页；返回空列表表示翻到底了喵。"""
-    query = urllib.parse.urlencode({"limit": PAGE_LIMIT, "page": page})
+def _fetch_page(session: urllib.request.OpenerDirector, page: int,
+                lo: int = 0, hi: int = 0) -> list[dict]:
+    """取第 page 页；返回空列表表示翻到底了喵。
+
+    输入: session；page 页码；lo/hi 给了就按 id 区间过滤
+    输出: tag 记录列表
+    预期: lo=hi=0 表示不限制区间（旧的整表分页行为）
+    """
+    params = {"limit": PAGE_LIMIT, "page": page}
+    if hi:
+        params["search[id]"] = f"{lo}..{hi}"
+    query = urllib.parse.urlencode(params)
     req = urllib.request.Request(f"{API}?{query}", headers={"User-Agent": USER_AGENT})
     with session.open(req, timeout=60) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _last_page(session: urllib.request.OpenerDirector, lo: int, hi: int,
+               retries: int = 8) -> int:
+    """二分出某个 id 区间的最后一个非空页，0 表示区间为空喵。
+
+    输入: session；lo/hi id 区间；retries 单页重试次数
+    输出: 页号
+    预期: 约 log2(1000) ≈ 10 次请求定位末页，避免逐页翻到空喵
+
+    Notes:
+        这正是之前空转 666 页的修法：区间里有多少条是**可以提前量出来**的，
+        量出来之后只翻这么多页，一页都不多请求喵。
+    """
+    def probe(page: int) -> list[dict]:
+        for attempt in range(1, retries + 1):
+            try:
+                return _fetch_page(session, page, lo, hi)
+            except OSError as exc:
+                wait = min(5 * attempt, 60)
+                print(f"  [探测 {lo}-{hi} 第 {page} 页] 第 {attempt} 次失败 "
+                      f"{type(exc).__name__}，等 {wait}s", flush=True)
+                time.sleep(wait)
+        raise RuntimeError(f"探测 {lo}-{hi} 第 {page} 页连续 {retries} 次失败")
+
+    if not probe(1):
+        return 0
+    valid, invalid = 1, MAX_PAGES + 1
+    while valid + 1 < invalid:
+        mid = (valid + invalid) // 2
+        if probe(mid):
+            valid = mid
+        else:
+            invalid = mid
+    return valid
+
+
 def download_tags(out: Path, proxy: str = "http://127.0.0.1:7890",
-                  sleep: float = 0.25, report_every: int = 20) -> int:
+                  sleep: float = 0.25, report_every: int = 20,
+                  ranges: list[tuple[int, int]] | None = None,
+                  retries: int = 8) -> int:
     """抓全库 tag 清单，一行一条 jsonl，断了能续喵。
 
-    输入: out 落地路径；proxy 为空则直连；sleep 每页间隔秒数
+    输入: out 落地路径；proxy 为空则直连；sleep 每页间隔秒数；
+          ranges id 区间列表，None 用默认三段；retries 单页重试次数
     输出: 落盘总行数
-    预期: 抓到空页为止；文件已存在时按行数换算页码继续，不重头抓
+    预期: 每个区间只翻它实际的页数；失败重试不跳过；同一 id 只写一次喵
+
+    Notes:
+        两条硬限制都必须在设计里体现，不能靠跑的时候发现喵：
+        1. `page >= 1001` 返回 410 Gone，单条查询最多 100 万条；
+        2. 区间条数可提前二分量出，翻够就停，否则会空转几百页喵。
     """
     session = _opener(proxy)
     out.parent.mkdir(parents=True, exist_ok=True)
-    done = 0
+    if ranges is None:
+        top = _max_id(session)
+        ranges = id_ranges(top)
+        print(f"当前最大 tag id {top:,}，切成 {len(ranges)} 段", flush=True)
+
+    seen: set[int] = set()
     if out.exists():
         with out.open("r", encoding="utf-8") as fp:
-            done = sum(1 for _ in fp)
-        print(f"续抓：已有 {done} 条", flush=True)
+            for line in fp:
+                try:
+                    seen.add(int(json.loads(line)["id"]))
+                except Exception:
+                    continue
+        print(f"续抓：已有 {len(seen)} 条", flush=True)
 
-    page = done // PAGE_LIMIT + 1
-    mode = "a" if done else "w"
+    written = len(seen)
+    mode = "a" if seen else "w"
     with out.open(mode, encoding="utf-8") as fp:
-        while True:
-            try:
-                rows = _fetch_page(session, page)
-            except OSError as exc:
-                # 抓一次要十几分钟，网络的临时抖动不该让进度白费喵
-                print(f"第 {page} 页失败 {type(exc).__name__}，5 秒后重试", flush=True)
-                time.sleep(5)
+        for lo, hi in ranges:
+            pages = _last_page(session, lo, hi, retries=retries)
+            if pages == 0:
+                print(f"[{lo}-{hi}] 区间为空，跳过", flush=True)
                 continue
-            if not rows:
-                break
-            for row in rows:
-                fp.write(json.dumps({
-                    "id": row["id"],
-                    "name": row["name"],
-                    "post_count": row["post_count"],
-                    "category": row["category"],
-                    "is_deprecated": row["is_deprecated"],
-                }, ensure_ascii=False) + "\n")
-            fp.flush()
-            done += len(rows)
-            if report_every and page % report_every == 0:
-                print(f"第 {page} 页，累计 {done} 条", flush=True)
-            page += 1
-            time.sleep(sleep)
-    return done
+            print(f"[{lo}-{hi}] 共 {pages} 页，开始抓", flush=True)
+            for page in range(1, pages + 1):
+                rows = None
+                for attempt in range(1, retries + 1):
+                    try:
+                        rows = _fetch_page(session, page, lo, hi)
+                        break
+                    except OSError as exc:
+                        wait = min(5 * attempt, 60)
+                        print(f"[{lo}-{hi}] 第 {page} 页第 {attempt} 次失败 "
+                              f"{type(exc).__name__}，等 {wait}s", flush=True)
+                        time.sleep(wait)
+                if rows is None:
+                    # 绝不跳过：跳过一页等于丢掉那 1000 条，事后无法定位喵
+                    raise RuntimeError(
+                        f"[{lo}-{hi}] 第 {page} 页连续 {retries} 次失败，"
+                        f"已写 {written} 条；重跑会按已有 id 续上喵"
+                    )
+                fresh = 0
+                for row in rows:
+                    if row["id"] in seen:
+                        continue
+                    seen.add(row["id"])
+                    fp.write(json.dumps({
+                        "id": row["id"],
+                        "name": row["name"],
+                        "post_count": row["post_count"],
+                        "category": row["category"],
+                        "is_deprecated": row["is_deprecated"],
+                    }, ensure_ascii=False) + "\n")
+                    fresh += 1
+                fp.flush()
+                written += fresh
+                if report_every and page % report_every == 0:
+                    print(f"[{lo}-{hi}] 第 {page} 页，累计 {written} 条", flush=True)
+                time.sleep(sleep)
+            print(f"[{lo}-{hi}] 区间完成，累计 {written} 条", flush=True)
+    return written
 
 
 def load_tags(path: Path) -> list[dict]:
