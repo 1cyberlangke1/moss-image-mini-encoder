@@ -2,7 +2,6 @@
 # torch 走 PyTorch 官方 CUDA 12.8 索引，Windows + Python 3.11 已验证可用：
 #   pip install -r requirements-encode.txt --extra-index-url https://download.pytorch.org/whl/cu128
 -r requirements.txt
-# cu128 索引上 Windows + Python 3.11 目前最高只到 2.11.0。
-torch==2.11.0+cu128
+torch==2.14.1
 transformers==5.21.0
 safetensors>=0.4.3

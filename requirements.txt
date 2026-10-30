@@ -7,5 +7,3 @@ numpy==2.4.6
 pyyaml==6.0.3
 tqdm==4.70.1
 pytest==9.1.1
-# 让 ssl 用系统证书库：GitHub 部分接口的证书链不完整，OpenSSL 不会补链。
-truststore==0.10.5
