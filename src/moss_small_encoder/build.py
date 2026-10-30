@@ -569,8 +569,8 @@ def write_card(path: Path, rows: list[dict], cfg: dict) -> None:
     lines.append("## 构建方式")
     lines.append("")
     lines.append("```bash")
-    lines.append("python scripts/download_models.py")
-    lines.append("python -m moss_small_encoder.build --config configs/dataset_v1.yaml")
+    lines.append("python src/scripts/download_models.py")
+    lines.append("python -m moss_small_encoder.build --config src/configs/dataset_v1.yaml")
     lines.append("```")
     lines.append("")
     lines.append("全部来源钉死 commit sha，随机种子固定，重跑结果一致。")
@@ -607,7 +607,7 @@ def write_card(path: Path, rows: list[dict], cfg: dict) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("configs/dataset_v1.yaml"))
+    parser.add_argument("--config", type=Path, default=Path("src/configs/dataset_v1.yaml"))
     parser.add_argument("--out", type=Path, default=None, help="覆盖输出目录")
     parser.add_argument("--limit", action="append", default=[], metavar="BUCKET=N")
     parser.add_argument(

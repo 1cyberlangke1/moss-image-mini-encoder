@@ -65,6 +65,37 @@ class TestRidgeAccumulator:
         cos_no_drop = ridge.cosine(acc_no_drop.solve(1e2).predict(x[clean]), y[clean])
         assert cos_drop > cos_no_drop
 
+    def test_drop_first_with_merged_lengths(self):
+        """拼接传入时，每段各丢前 drop_first 行，与逐 prompt 调用等价。
+
+        这是最容易静默出错的点：合并成大块 GEMM 后，如果误把整块当成
+        一条 prompt（只丢第 0 行），sink 会漏进拟合，且没有任何报错。
+        """
+        x, y, _ = self._data(n=1200)
+        seg_len = 10
+        lengths = [seg_len] * (1200 // seg_len)
+        sink_rows = np.arange(0, 1200, seg_len)
+
+        # 逐段喂（旧调用方式）。
+        per_prompt = ridge.RidgeAccumulator(x.shape[1], y.shape[1], drop_first=1)
+        for start in range(0, 1200, seg_len):
+            per_prompt.add(x[start : start + seg_len], y[start : start + seg_len])
+        # 拼接喂（新调用方式，一次大 GEMM）。
+        merged = ridge.RidgeAccumulator(x.shape[1], y.shape[1], drop_first=1)
+        merged.add(x, y, lengths=lengths)
+
+        assert per_prompt.n == 1200 - len(sink_rows)
+        assert merged.n == per_prompt.n
+        # 两种喂法必须给出同一个解。
+        assert np.allclose(
+            merged.solve(1e2).W, per_prompt.solve(1e2).W, atol=1e-6
+        )
+        # 反例：不给 lengths 时只丢第 0 行，n 必然不同——防止有人把
+        # 「拼接但忘了 lengths」当成等价用法。
+        wrong = ridge.RidgeAccumulator(x.shape[1], y.shape[1], drop_first=1)
+        wrong.add(x, y)
+        assert wrong.n == 1200 - 1
+
     def test_standardization_moments(self):
         rng = np.random.default_rng(3)
         x = (rng.normal(size=(500, 4)) * 3 + 7).astype(np.float32)
@@ -192,3 +223,85 @@ class TestFeatureStore:
         loaded = store.FeatureStore.open(tmp_path)
         assert loaded.token_indices(np.array([0, 2])).tolist() == [0, 1, 4, 5]
         assert loaded.token_indices(np.array([], dtype=int)).size == 0
+
+
+class TestRidgeCache:
+    """Ridge 结果缓存的往返与失效规则。
+
+    缓存是纯加速手段：命中要给出与重算完全相同的结果，未命中或读坏要安静地
+    退回重算，不能让训练多一种失败方式。
+    """
+
+    @staticmethod
+    def _accumulator(d_in: int = 8, d_out: int = 4, n: int = 256, seed: int = 3):
+        rng = np.random.default_rng(seed)
+        x = rng.normal(size=(n, d_in)).astype(np.float32)
+        y = x @ rng.normal(size=(d_in, d_out)).astype(np.float32)
+        acc = ridge.RidgeAccumulator(d_in, d_out, drop_first=0)
+        acc.add(x, y)
+        return acc
+
+    def test_accumulator_roundtrip_gives_same_solution(self, tmp_path):
+        """累加器存盘再读回，统计量与解都必须逐元素一致。
+
+        输入: 随机特征累加出的累加器。
+        输出: 无（断言）。
+        预期: 六组统计量与 n 完全相同；同一 λ 下 W 完全相同（不是近似）。
+        """
+        acc = self._accumulator()
+        path = tmp_path / "stats.npz"
+        ridge.save_accumulator(path, acc)
+
+        loaded = ridge.load_accumulator(path, drop_first=0)
+        assert loaded is not None
+        assert loaded.n == acc.n
+        assert (loaded.d_in, loaded.d_out) == (acc.d_in, acc.d_out)
+        for name in ("xx", "xy", "sx", "sy", "sx2", "sy2"):
+            original = getattr(acc, name).detach().cpu().numpy()
+            restored = getattr(loaded, name).detach().cpu().numpy()
+            assert np.array_equal(original, restored), name
+
+        assert np.array_equal(acc.solve(1e-3).W, loaded.solve(1e-3).W)
+
+    def test_solution_roundtrip(self, tmp_path):
+        """解与 λ 扫描记录存盘再读回，数值与顺序都不变。"""
+        solution = self._accumulator().solve(1e-2)
+        grid = [(1e-2, 0.5, 0.8), (1e-1, 0.4, 0.9)]
+        path = tmp_path / "solution.npz"
+        ridge.save_solution(path, solution, grid)
+
+        loaded = ridge.load_solution(path)
+        assert loaded is not None
+        restored, restored_grid = loaded
+        assert restored.lam == solution.lam
+        assert restored.n_tokens == solution.n_tokens
+        for name in ("W", "mean_in", "std_in", "mean_out", "std_out"):
+            assert np.array_equal(getattr(restored, name), getattr(solution, name)), name
+        assert restored_grid == grid
+
+    def test_missing_cache_returns_none(self, tmp_path):
+        """文件不存在时返回 None，调用方据此回退到重算。"""
+        assert ridge.load_accumulator(tmp_path / "nope.npz", drop_first=1) is None
+        assert ridge.load_solution(tmp_path / "nope.npz") is None
+
+    def test_corrupt_cache_returns_none(self, tmp_path):
+        """读坏的文件只降级成重算，不抛异常打断训练。"""
+        path = tmp_path / "broken.npz"
+        path.write_bytes(b"not a npz at all")
+        assert ridge.load_accumulator(path, drop_first=1) is None
+        assert ridge.load_solution(path) is None
+
+    def test_stats_key_depends_on_meta_and_drop_first(self):
+        """换特征或换 sink 口径都必须换键，避免误命中旧缓存。"""
+        base = ridge.ridge_stats_key(b'{"a":1}', drop_first=1)
+        assert base == ridge.ridge_stats_key(b'{"a":1}', drop_first=1)
+        assert base != ridge.ridge_stats_key(b'{"a":2}', drop_first=1)
+        assert base != ridge.ridge_stats_key(b'{"a":1}', drop_first=0)
+
+    def test_solution_key_depends_on_grid_and_eval_tokens(self):
+        """换 λ 网格、验证 token 数或上游键都必须换键。"""
+        base = ridge.ridge_solution_key("abc", (1e0, 1e1), 50_000)
+        assert base == ridge.ridge_solution_key("abc", (1e0, 1e1), 50_000)
+        assert base != ridge.ridge_solution_key("abc", (1e0, 1e2), 50_000)
+        assert base != ridge.ridge_solution_key("abc", (1e0, 1e1), 1_000)
+        assert base != ridge.ridge_solution_key("abd", (1e0, 1e1), 50_000)
