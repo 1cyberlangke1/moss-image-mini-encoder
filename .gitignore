@@ -69,10 +69,14 @@ build-*/
 /models/*
 !/models/README.md
 
+# dataset/ 下只有 3 份文档入库，语料与 features/ 全部忽略。
 /dataset/*
 !/dataset/stats.md
 !/dataset/dataset_card.md
 !/dataset/manifest.json
+
+# 训练产出的适配器与检查点都是可复现的中间产物，不入库。
+/output/*
 
 # AI AGENT 本地笔记（不入库）
 AGENTS.md
