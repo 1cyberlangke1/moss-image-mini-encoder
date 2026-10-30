@@ -30,6 +30,12 @@ ENDPOINT = "https://query.wikidata.org/sparql"
 UA = "moss-image-mini-encoder/0.1 (dataset preparation)"
 DEFAULT_PROXY = "http://127.0.0.1:7890"
 PAGE = 5000
+# 企业类实例量是品牌类的几十倍，带 ORDER BY 查询会直接超时（实测 HTTPError）喵。
+# 单独给它更小的页，并且不排序——代价是分页顺序不保证稳定，靠 seen 去重兜底喵。
+PAGE_OVERRIDE = {"Q4830453": 5000}
+NO_ORDER = {"Q4830453"}
+# 企业类里大量是没有中文/英文名的空壳条目，给个极低门槛压掉噪声喵。
+MIN_SITELINKS = {"Q4830453": 1}
 
 # 全部来自锚点实测（见 tmp/anchor_cover.py 的输出），不是凭印象写的喵。
 ROOT_TYPES: dict[str, str] = {
@@ -42,6 +48,21 @@ ROOT_TYPES: dict[str, str] = {
     "Q76220181": "冰淇淋连锁店",
     "Q114392939": "饮料品牌",
 }
+
+
+def _to_simplified(name: str) -> str:
+    """把繁体名转成简体喵。
+
+    输入: name 实体名
+    输出: 简体名；没装 zhconv 时原样返回
+    预期: label 服务在 zh-hans 缺失时会回退到 zh（繁体），
+          实测「三菱電機」「蘋果公司」就是这么来的，所以本地补一道喵
+    """
+    try:
+        from zhconv import convert
+    except ImportError:
+        return name
+    return convert(name, "zh-cn")
 
 
 def _opener(proxy: str) -> urllib.request.OpenerDirector:
@@ -74,18 +95,22 @@ def page_query(type_qid: str, offset: int, limit: int) -> str:
 
     输入: type_qid 类型；offset 偏移；limit 页大小
     输出: SPARQL 字符串
-    预期: ORDER BY ?item 保证分页稳定，不会漏也不会重
+    预期: 小类型带 ORDER BY 保证分页稳定；企业类不排序，避免超时
     """
+    order = "" if type_qid in NO_ORDER else "ORDER BY ?item"
+    floor = MIN_SITELINKS.get(type_qid, 0)
+    floor_clause = f"FILTER(?n >= {floor})" if floor else ""
     return f"""
 SELECT ?item ?name ?n WHERE {{
   ?item wdt:P31 wd:{type_qid} .
   ?item wikibase:sitelinks ?n .
+  {floor_clause}
   SERVICE wikibase:label {{
     bd:serviceParam wikibase:language "zh-hans,zh,en".
     ?item rdfs:label ?name .
   }}
 }}
-ORDER BY ?item
+{order}
 LIMIT {limit} OFFSET {offset}
 """
 
@@ -123,11 +148,12 @@ def fetch_type(
         rows = None
         for attempt in range(1, retries + 1):
             try:
-                rows = sparql(session, page_query(type_qid, offset, PAGE))
+                rows = sparql(session, page_query(type_qid, offset, PAGE_OVERRIDE.get(type_qid, PAGE)))
                 break
             except Exception as exc:
+                detail = getattr(exc, "code", "")
                 print(f"  [{type_qid} offset={offset}] 第 {attempt} 次失败 "
-                      f"{type(exc).__name__}", flush=True)
+                      f"{type(exc).__name__} {detail}", flush=True)
                 time.sleep(3)
         if rows is None:
             print(f"  [{type_qid} offset={offset}] 放弃该页", flush=True)
@@ -136,7 +162,7 @@ def fetch_type(
             break
         for row in rows:
             qid = row["item"].rsplit("/", 1)[-1]
-            name = row.get("name", "").strip()
+            name = _to_simplified(row.get("name", "").strip())
             # label 服务取不到中文/英文时会把 QID 自己当名字返回，这种没法用于提示词喵
             if not name or name == qid:
                 continue
@@ -152,7 +178,7 @@ def fetch_type(
             }, ensure_ascii=False) + "\n")
             added += 1
         sink.flush()
-        offset += PAGE
+        offset += PAGE_OVERRIDE.get(type_qid, PAGE)
         print(f"  {ROOT_TYPES.get(type_qid, type_qid)} offset={offset} "
               f"+{len(rows)} 累计新增 {added:,}", flush=True)
     return added

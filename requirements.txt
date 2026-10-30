@@ -14,6 +14,9 @@ pytest==9.1.1
 psutil>=5.9.0
 # 让 ssl 用系统证书库：GitHub 部分接口的证书链不完整，OpenSSL 不会补链。
 truststore==0.10.5
+# Wikidata 的 label 服务在 zh-hans 缺失时回退到繁体（三菱電機/蘋果公司），
+# 抓实体时本地再转一次简体。纯 Python 字典，无二进制依赖。
+zhconv>=1.4.3
 
 # ---------- 编码与训练 ----------
 # cu128 索引上 Windows + Python 3.11 目前最高只到 2.11.0。

@@ -33,7 +33,7 @@ import yaml
 from tqdm import tqdm
 
 from . import clean, labels, synth_layout
-from .sources import SOURCES, entities, goku, gustavosta, jtatman, moss_official, n714, shuixian
+from .sources import SOURCES, danbooru, entities, goku, gustavosta, jtatman, moss_official, n714, shuixian
 from .tokenizer import MAX_TEXT_TOKENS, MossTokenizer
 
 # 源 -> 清洗函数。每个函数只做「这个词源已知的污染」。
@@ -305,6 +305,38 @@ def _iter_entities(bucket: dict, cfg: dict) -> Iterator[dict]:
         }
 
 
+def _iter_characters(bucket: dict, cfg: dict) -> Iterator[dict]:
+    """产出 danbooru 角色变体（只给名字，不给属性词）。
+
+    Args:
+        bucket: 桶配置（tags / per_character / max_characters / min_post_count）。
+        cfg: 全局配置（用到 seed）。
+
+    Yields:
+        文本已就绪、无需清洗的记录。
+
+    Notes:
+        角色名里常带作品名和括号，`sanitize_unicode` 不会动它们；
+        这里不做任何清洗，因为 danbooru 的 tag 写法本身就是合法的提示词喵。
+    """
+    for record in danbooru.iter_characters(
+        Path(bucket["tags"]),
+        per_character=bucket["per_character"],
+        seed=cfg["seed"],
+        max_characters=bucket.get("max_characters"),
+        min_post_count=bucket.get("min_post_count", 0),
+    ):
+        yield {
+            "text": record.text,
+            "source": "danbooru",
+            "source_id": record.source_id,
+            "kind": "positive",
+            "nsfw": False,
+            "meta": record.meta,
+            "lang": "en",
+        }
+
+
 def _iter_tags(bucket: dict, cfg: dict) -> Iterator[dict]:
     """产出由中文标签组合成的 tag 流提示词。
 
@@ -355,6 +387,7 @@ ITERATORS: dict[str, Callable[[dict, dict], Iterator[dict]]] = {
     "synth": _iter_synth,
     "tag_compose": _iter_tags,
     "enumerate": _iter_entities,
+    "characters": _iter_characters,
     "official": _iter_official,
 }
 

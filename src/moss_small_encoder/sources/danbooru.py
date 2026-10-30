@@ -27,6 +27,20 @@ API = "https://danbooru.donmai.us/tags.json"
 PAGE_LIMIT = 1000
 USER_AGENT = "moss-image-mini-encoder/0.1"
 
+# 角色名后面的槽位：**一个外观词都没有**喵。
+# 写「黑发红瞳」这类就是在替教师回答，学到的会变成「描述 → 向量」，
+# 而我们真正要的是「名字 → 向量」，外观必须由教师自己提供喵。
+CHARACTER_TEMPLATES = [
+    "{x}",
+    "{x}，特写",
+    "{x}，远景",
+    "{x}，站姿，全身",
+    "{x}，黄昏，街景",
+    "{x}，室内，柔和光线",
+    "{x}，侧面，半身",
+    "画一张{x}",
+]
+
 # Danbooru 的 category 编号：0 通用、1 画师、3 作品、4 角色、5 meta
 CATEGORY_GENERAL = 0
 CATEGORY_SERIES = 3
@@ -205,6 +219,79 @@ def iter_records(tags_path: Path, count: int, seed: int = 20261027,
             kind="positive",
             meta={"character": char["name"], "series_tag": has_series},
         )
+
+
+def iter_characters(
+    tags_path: Path,
+    per_character: int,
+    seed: int = 20261027,
+    max_characters: int | None = None,
+    min_post_count: int = 0,
+    templates: list[str] | None = None,
+) -> Iterator[Record]:
+    """按角色展开变体，**只给名字、不给任何属性词**。
+
+    输入: tags_path 全库 tag 清单；per_character 每个角色多少条；
+          max_characters 最多取多少角色（None 表示全要）；
+          min_post_count 热度下限（0 表示低频也要）
+    输出: `Record` 流，source 为 `danbooru`
+    预期: 每个角色都被覆盖；同一角色的所有变体共享 source_id
+
+    Notes:
+        为什么不像 `iter_records` 那样配属性：通用属性是随机抽的，
+        给黑发角色配上 `blonde_hair` 会把错误绑定喂进教师喵。
+        外观必须由教师自己提供，我们只搬运「名字 → 向量」喵。
+
+        名字给两种写法：danbooru 原生 `kayoko_(blue_archive)` 和可读的
+        `kayoko (blue archive)`，因为用户两种都可能写喵。
+    """
+    tags = load_tags(tags_path)
+    characters = [r for r in tags if r["category"] == CATEGORY_CHARACTER]
+    if min_post_count:
+        characters = [r for r in characters if r["post_count"] >= min_post_count]
+    if max_characters is not None:
+        characters = characters[:max_characters]
+    if not characters:
+        raise ValueError("tag 清单里没有角色，检查下载是否完整")
+
+    slots = templates or CHARACTER_TEMPLATES
+    for character in characters:
+        raw = character["name"]
+        readable = _pretty(raw)
+        variants: list[str] = []
+        for template in slots:
+            variants.append(template.format(x=readable))
+            if raw != readable:
+                variants.append(template.format(x=raw))
+        picked = _sample_strings(variants, per_character, f"{raw}|{seed}")
+        for index, text in enumerate(picked):
+            yield Record(
+                text=text,
+                source="danbooru",
+                source_id=f"{character['id']}:{index:03d}",
+                lang="en",
+                nsfw=None,
+                kind="positive",
+                meta={"character": raw, "post_count": character["post_count"]},
+            )
+
+
+def _sample_strings(pool: list[str], count: int, salt: str) -> list[str]:
+    """从候选里确定性抽 count 条，不足则全给喵。
+
+    输入: pool 候选；count 目标条数；salt 播种用盐
+    输出: 去重后的列表
+    预期: 同一 (pool, count, salt) 永远给出同一批
+    """
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for text in pool:
+        if text not in seen:
+            seen.add(text)
+            uniq.append(text)
+    if count >= len(uniq):
+        return uniq
+    return random.Random(salt).sample(uniq, count)
 
 
 def main(argv: list[str] | None = None) -> int:

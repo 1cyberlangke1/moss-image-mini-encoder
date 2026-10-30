@@ -98,3 +98,14 @@ buckets:
     per_entity: 8
     min_sitelinks: 0
     quota: 2000000
+
+  # ---- 第二代新增：二次元角色桶 ----
+  # 名字来自 danbooru 的 character tag，低频角色也要（min_post_count=0）。
+  # 同样只给名字、不配属性词：随机属性会给黑发角色配 blonde_hair，
+  # 把错误绑定喂进教师喵。
+  - name: characters
+    kind: characters
+    tags: dataset/danbooru_api/tags.jsonl
+    per_character: 8
+    min_post_count: 0
+    quota: 2000000
