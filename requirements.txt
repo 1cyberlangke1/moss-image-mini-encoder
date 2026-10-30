@@ -29,6 +29,10 @@ comfy_kitchen==0.2.40
 # torch 2.11.0 对应 triton 3.6.0，装错版本会在 inductor 阶段直接崩。
 triton-windows==3.6.0.post26 ; sys_platform == "win32"
 
+# 主干微调只挂 LoRA，用官方实现；实测 Qwen3.5 的线性注意力层也能正确命中，
+# 初始化后输出与原模型逐位相同，冻结层不会拿到梯度。
+peft==0.21.2
+
 # 0.8B / 9B 的 gated delta rule 与 causal conv1d 走融合 kernel。
 # 不装这两个包，transformers 会退回 PyTorch 参考实现，实测慢 4~5 倍。
 flash-linear-attention==0.6.0
