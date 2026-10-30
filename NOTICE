@@ -1,0 +1,50 @@
+moss-image-mini-encoder
+Copyright 2026 1cyberlangke1 (https://github.com/1cyberlangke1)
+
+本产品包含由下列项目贡献的实现、格式与数据，按各自许可使用。
+
+--------------------------------------------------------------------------------
+代码 / 方法
+--------------------------------------------------------------------------------
+
+ComfyUI-ClipProj — MIT License
+  https://github.com/nicolab28/ComfyUI-ClipProj
+  本项目参考了其标准化特征空间投影与多抽头特征提取的设计思路。
+  校准参考脚本：https://github.com/nicolab28/ClipProj-calibration
+
+moss-image-smaller-encoder — Apache License 2.0
+  https://github.com/bakapotatolord/moss-image-smaller-encoder
+  https://huggingface.co/PotatoForge/moss-image-4b-encoder-adapter
+  本项目参考了其 MOSS 适配器格式规范与分层评估方式。
+
+MOSS-Image — Apache License 2.0
+  https://github.com/OpenMOSS/MOSS-Image
+  本项目基于其公开的提示词模板规范、布局序列化规则与 4096 token 上限进行适配，
+  未复用其运行时代码。
+
+Qwen3.5 — Apache License 2.0
+  https://huggingface.co/Qwen/Qwen3.5-0.8B
+  基础语言模型。
+
+--------------------------------------------------------------------------------
+数据（不随本仓库分发）
+--------------------------------------------------------------------------------
+
+shuixian-prompts — Attribution Required License v1.0
+  https://github.com/BaYue-SYJ/shuixian-prompts
+  训练语料引用了其中的中文提示词，使用时保留署名。
+
+gpt-image-2-prompts-datasets — CC BY 4.0
+  https://huggingface.co/datasets/Goku-OpenLab/gpt-image-2-prompts-datasets
+
+stable-diffusion-prompts-stats-full-uncensored — 上游未标注许可
+  https://huggingface.co/datasets/jtatman/stable-diffusion-prompts-stats-full-uncensored
+
+Stable-Diffusion-Prompts — 上游未标注许可
+  https://huggingface.co/datasets/Gustavosta/Stable-Diffusion-Prompts
+
+stable-diffusion-prompt-library-zh_CN — MIT License
+  https://github.com/n714/stable-diffusion-prompt-library-zh_CN
+
+本仓库不包含上述数据集的原始数据；`dataset/` 目录由构建脚本在本地生成且不入库。
+数据的使用与再分发需各自遵守其原始许可。
