@@ -1,6 +1,6 @@
 # 数据集说明 (Dataset Card)
 
-本项目用于训练 Qwen3.5 较小规模文本编码器（0.8B / 2B / 4B）对齐 MOSS-Image 9B 教师模型特征的逐 Token 投影层。
+本项目用于训练 Qwen3.5 学生文本编码器（0.8B / 2B / 4B）对齐 MOSS-Image 9B 教师模型特征的逐 Token 线性投影层。
 
 ---
 
@@ -14,7 +14,7 @@ python src/scripts/download_models.py
 python -m moss_small_encoder.build --config src/configs/dataset_v1.yaml
 ```
 
-所有外部数据源均锁定固定的 Commit SHA，结合固定随机种子保证数据构建过程的严格可复现性。
+外部数据源均锁定固定 Commit SHA，配合固定随机种子确保构建过程可严格复现。
 
 ---
 
@@ -23,7 +23,7 @@ python -m moss_small_encoder.build --config src/configs/dataset_v1.yaml
 | 来源标识 | 样本条数 | 许可协议 | 原始地址 |
 | --- | ---: | --- | --- |
 | `goku` | 6,676 | CC BY 4.0 | https://huggingface.co/datasets/Goku-OpenLab/gpt-image-2-prompts-datasets |
-| `gustavosta` | 8,000 | 未标注（源数据集卡片标注为 unknown） | https://huggingface.co/datasets/Gustavosta/Stable-Diffusion-Prompts |
+| `gustavosta` | 8,000 | 未标注 | https://huggingface.co/datasets/Gustavosta/Stable-Diffusion-Prompts |
 | `jtatman` | 12,800 | 未标注（源自 Civitai 社区语料） | https://huggingface.co/datasets/jtatman/stable-diffusion-prompts-stats-full-uncensored |
 | `moss_official` | 20 | Apache-2.0 | https://github.com/OpenMOSS/MOSS-Image |
 | `n714` | 4,000 | MIT | https://github.com/n714/stable-diffusion-prompt-library-zh_CN |
@@ -36,9 +36,9 @@ python -m moss_small_encoder.build --config src/configs/dataset_v1.yaml
 
 ---
 
-## 数据集已知特性
+## 数据集特性
 
-- **长度约束**：超过 4096 Token 的样本整条剔除，与模型实际推理端上限保持一致。
-- **语种与翻译**：`goku` 包含部分机器翻译中文内容，主要用于扩充多语言词汇覆盖。
-- **布局格式**：`synth_layout` 由模板确定性生成，用于覆盖 MOSS-Image 的特定排版语法。
-- **内容标注**：采用源数据原生标签与关键词启发式规则结合进行分层抽样。
+- **长度约束**：超过 4096 Token 的样本整条剔除，避免截断产生断句破坏语义；
+- **语种与翻译**：`goku` 包含部分机器翻译中文内容，用于扩充多语言词汇覆盖；
+- **布局格式**：`synth_layout` 由模板生成，用于覆盖 MOSS-Image 的排版与坐标语法；
+- **分层抽样**：采用原生标签与关键词规则结合进行抽样与数据平衡。
