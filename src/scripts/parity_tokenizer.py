@@ -14,7 +14,7 @@ ComfyUI 自带的那份词表（`qwen35_tokenizer/vocab.json` + `merges.txt`）�
    tokenizers 对象，复制 HF 的 pipeline，在故意刁钻的语料上逐条比对 id。
 
 用法：
-    python tools/parity_tokenizer.py \
+    python src/scripts/parity_tokenizer.py \
         --hf models/tokenizer/tokenizer.json \
         --comfy <ComfyUI>/comfy/text_encoders/qwen35_tokenizer \
         --end-to-end
