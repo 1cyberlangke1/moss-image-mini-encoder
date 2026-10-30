@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moss-small-encoder"
+version = "0.1.0"
+description = "用 Qwen3.5-0.8B 加逐 token 投影替换 MOSS-Image 的 Qwen3.5-9B 文本编码器"
+readme = "README.md"
+requires-python = ">=3.11"
+
+# 只跑数据构建（不跑编码/训练）时的最小依赖；torch 那套见 requirements.txt
+dependencies = [
+    "numpy>=2.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+    "safetensors>=0.4",
+    "huggingface_hub>=0.24",
+    "pyarrow>=15",
+    "tokenizers>=0.20",
+]
+
+[project.optional-dependencies]
+# 编码与训练额外需要的东西。版本以 requirements.txt 的钉死值为准。
+train = [
+    "torch>=2.7",
+    "transformers>=5.21",
+    "comfy-kitchen>=0.2.40",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+# comfyui_node 由 ComfyUI 按目录加载，其余三个不是包，都不该进 site-packages
+exclude = ["comfyui_node*", "tests*", "scripts*", "tools*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["src/tests"]

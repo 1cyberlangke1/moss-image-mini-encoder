@@ -1,5 +1,9 @@
-# 数据集构建只需要这些，装起来很快。
-# 需要跑编码/训练时再装 requirements-encode.txt。
+# 全部依赖一次装齐。
+# torch 在 PyTorch 官方 CUDA 12.8 索引上，所以要带 --extra-index-url：
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128
+# 只想构建训练集（不跑编码/训练）时，单独装前 8 行即可，省下几个 GB。
+
+# ---------- 数据与基础工具 ----------
 huggingface_hub==2.3.0
 tokenizers==0.23.3
 pyarrow==26.0.0
@@ -7,5 +11,31 @@ numpy==2.4.6
 pyyaml==6.0.3
 tqdm==4.70.1
 pytest==9.1.1
+psutil>=5.9.0
 # 让 ssl 用系统证书库：GitHub 部分接口的证书链不完整，OpenSSL 不会补链。
 truststore==0.10.5
+
+# ---------- 编码与训练 ----------
+# cu128 索引上 Windows + Python 3.11 目前最高只到 2.11.0。
+torch==2.11.0+cu128
+transformers==5.21.0
+safetensors>=0.4.3
+
+# w4a8 量化权重的反量化与融合 matmul（Apache-2.0，自身没有强制依赖）。
+# 9B 的 6.84 GiB int8 权重靠它常驻显存，不展开成 18.4 GB 的 bf16。
+comfy_kitchen==0.2.40
+
+# torch.compile 需要 triton。Windows 用 triton-windows，版本必须与 torch 对齐：
+# torch 2.11.0 对应 triton 3.6.0，装错版本会在 inductor 阶段直接崩。
+triton-windows==3.6.0.post26 ; sys_platform == "win32"
+
+# 0.8B / 9B 的 gated delta rule 与 causal conv1d 走融合 kernel。
+# 不装这两个包，transformers 会退回 PyTorch 参考实现，实测慢 4~5 倍。
+flash-linear-attention==0.6.0
+fla-core==0.6.0
+einops>=0.8
+
+# causal-conv1d 在 Windows 上没有预编译 wheel，setup.py 还会尝试联网下载
+# 不存在的资产。必须本机编译，步骤见 README「编码」一节，所以不写进这里
+# 以免 `pip install -r` 因为编译环境缺失而整体失败。
+# causal-conv1d==1.7.0
