@@ -86,3 +86,4 @@ progress.md
 task_plan.md
 .claude/
 .playwright-mcp/
+/.githooks/
