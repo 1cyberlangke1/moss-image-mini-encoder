@@ -21,6 +21,10 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
+from transformers.utils import (
+    is_causal_conv1d_available,
+    is_flash_linear_attention_available,
+)
 
 from .common import MODEL_PREFIX, build_config, restore_rope, restore_ssm_dtype
 
@@ -186,6 +190,34 @@ def swap_quantized_modules(
             setattr(parent, leaf, dense)
 
 
+def _require_packed_deps() -> None:
+    """检查 packed 需要的三项能力，缺任何一项立刻失败。
+
+    Raises:
+        ImportError: 缺 `flash-attn` / `causal-conv1d` / `flash-linear-attention` 之一。
+
+    Notes:
+        三项都不能退化成别的实现：
+        缺 `flash-attn` 就没有 varlen 接口，`sdpa` 会忽略 `cu_seqlens`；
+        缺 `flash-linear-attention`，gated delta rule 退回 PyTorch 版，不认 `cu_seqlens`；
+        缺 `causal-conv1d`，卷积退回 `F.conv1d`，而它不看 `seq_idx`。
+        后两种退化都是静默的跨段串味，结果看起来正常但数值全错，所以这里直接拦住。
+    """
+    missing: list[str] = []
+    try:
+        import flash_attn  # noqa: F401
+    except Exception:
+        missing.append("flash-attn")
+    if not is_causal_conv1d_available():
+        missing.append("causal-conv1d")
+    if not is_flash_linear_attention_available():
+        missing.append("flash-linear-attention")
+    if missing:
+        raise ImportError(
+            "packed 模式需要 " + " / ".join(missing) + "，安装方法见 docs/pipeline.md"
+        )
+
+
 class TeacherEncoder:
     """Qwen3.5-9B 的 w4a8 权重编码器（只出最后一层隐状态）。
 
@@ -211,11 +243,17 @@ class TeacherEncoder:
         device: str | torch.device = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         verbose: bool = False,
+        packed: bool = False,
     ) -> None:
         self.device = torch.device(device)
         self.dtype = dtype
+        self.packed = packed
+        if packed:
+            _require_packed_deps()
         config = build_config(Path(config_path))
-        config._attn_implementation = "sdpa"
+        # packed 走 flash_attention_2：只有它的 varlen 接口认 cu_seqlens，
+        # sdpa 会静默忽略这些键，结果就是跨段串味而不报错。
+        config._attn_implementation = "flash_attention_2" if packed else "sdpa"
 
         with torch.device("meta"):
             model = Qwen3_5TextModel(config)
@@ -279,6 +317,48 @@ class TeacherEncoder:
         out = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            use_cache=False,
+        )
+        return out.last_hidden_state
+
+    @torch.inference_mode()
+    def encode_packed(self, input_ids: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+        """把多条序列首尾相接，一次前向，返回拼平后的隐状态。
+
+        Args:
+            input_ids: `[1, total]` int64，多条 prompt 的 token 直接连在一起，中间不插 pad。
+            cu_seqlens: `[N + 1]` int32，累积长度，单调递增且首项为 0、末项为 total。
+
+        Returns:
+            `[1, total, hidden]` bf16。第 i 条序列对应 `cu_seqlens[i] : cu_seqlens[i + 1]`。
+
+        Notes:
+            `position_ids` 与 `seq_idx` 都从 `cu_seqlens` 反推，不额外传参，避免两边不一致。
+            `position_ids` 按段从 0 重开，否则第 2 条起会带上前一条的位置偏移。
+            `seq_idx` 让 kernel 等于 4 的 causal conv1d 在段边界重置，
+            否则前一条的尾部会卷进后一条的开头。
+            `attention_mask` 传字典是为了跳过 mask 构造：varlen 分支要求它是 None。
+        """
+        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        device = input_ids.device
+        positions = torch.cat(
+            [torch.arange(length, device=device, dtype=torch.long) for length in lengths]
+        )
+        position_ids = positions.view(1, 1, -1).expand(4, 1, -1)
+        seq_idx = torch.repeat_interleave(
+            torch.arange(len(lengths), device=device, dtype=torch.int32),
+            torch.tensor(lengths, device=device),
+        ).unsqueeze(0)
+
+        out = self.model(
+            input_ids=input_ids,
+            attention_mask={"full_attention": None, "linear_attention": None},
+            position_ids=position_ids,
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            max_length_q=max(lengths),
+            max_length_k=max(lengths),
+            seq_idx=seq_idx,
             use_cache=False,
         )
         return out.last_hidden_state

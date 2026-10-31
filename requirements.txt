@@ -46,3 +46,12 @@ einops>=0.8
 # 不存在的资产。必须本机编译，步骤见 README「编码」一节，所以不写进这里
 # 以免 `pip install -r` 因为编译环境缺失而整体失败。
 # causal-conv1d==1.7.0
+
+# packed 编码（--packed）除了上面两个包，还要 flash-attn 的 varlen 接口。
+# 它同样没有 PyPI 的 Windows wheel，只有社区预编译版，且必须与 torch 和
+# CUDA 小版本严格对齐，下面这条对应 cu128 + torch 2.11 + cp311：
+#   pip install --no-deps https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.6/flash_attn-2.8.3+cu128torch2.11-cp311-cp311-win_amd64.whl
+# 换一个组合这条地址就不存在，所以不进硬清单，避免 `pip install -r` 整体失败。
+# packed 三项缺一不可：flash-attn、flash-linear-attention、causal-conv1d。
+# 缺 causal-conv1d 时卷积会退回 F.conv1d，而它不看 seq_idx，
+# 相邻序列会互相污染且不报错，所以代码在入口处直接拦。

@@ -86,7 +86,11 @@ def load_prompts(
 
 
 def make_batches(
-    rows: list[dict], budget: int, max_prompts: int, max_aspect: float = 3.0
+    rows: list[dict],
+    budget: int,
+    max_prompts: int,
+    max_aspect: float = 3.0,
+    packed: bool = False,
 ) -> list[list[dict]]:
     """按 token 预算切批。
 
@@ -98,6 +102,7 @@ def make_batches(
             短样本会带来等量的无效计算，所以长度悬殊时宁可提前关批。
             默认 3.0 由实测选定：放宽到 4.0~6.0 补齐会变多，收紧到 1.6~2.0
             批数（因而固定开销）会翻倍，总耗时在 3.0 附近最低。
+        packed: 为真时不做补齐，`max_aspect` 失效，预算按真实 token 填满。
 
     Returns:
         批次列表。
@@ -117,12 +122,11 @@ def make_batches(
         length = row["n_tokens"]
         # 双向判断：新样本比批内最长的短太多、或比最短的长太多，都会让补齐变浪费。
         # 只看一个方向不够——调用方给的是洗牌后的顺序，长样本可能后到。
-        if current and (
-            used + length > budget
-            or len(current) >= max_prompts
-            or longest > length * max_aspect
-            or length > shortest * max_aspect
-        ):
+        # packed 不补齐，这两个条件只会白白关批，所以只留预算和条数两条。
+        crowded = used + length > budget or len(current) >= max_prompts
+        if not packed:
+            crowded = crowded or longest > length * max_aspect or length > shortest * max_aspect
+        if current and crowded:
             batches.append(current)
             current, used, longest, shortest = [], 0, 0, 0
         if not current:
@@ -164,6 +168,37 @@ def pad_batch(
     return input_ids.to(device), attention_mask.to(device), lengths
 
 
+def pack_batch(
+    rows: list[dict], tokenizer: MossTokenizer, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    """把一批样本首尾相接成一条连续序列，不补 padding。
+
+    Args:
+        rows: 批内样本。
+        tokenizer: MOSS 分词器。
+        device: 目标设备。
+
+    Returns:
+        `(input_ids, cu_seqlens, lengths)`；`input_ids` 是 `[1, total]`，
+        `cu_seqlens` 是 `[N + 1]` int32 累积长度。
+
+    Notes:
+        拼接顺序就是 `rows` 的顺序，切片按 `cu_seqlens` 还原，所以写盘顺序不变。
+        空样本会让 `cu_seqlens` 出现重复值，这里直接拒绝，避免下游无法区分。
+    """
+    encoded = [tokenizer.encode(row["text"]) for row in rows]
+    lengths = [len(ids) for ids in encoded]
+    if not lengths or min(lengths) <= 0:
+        raise ValueError(f"pack_batch 收到空样本：{lengths}")
+    flat = [token for ids in encoded for token in ids]
+    input_ids = torch.tensor(flat, dtype=torch.long, device=device).unsqueeze(0)
+    bounds = [0]
+    for length in lengths:
+        bounds.append(bounds[-1] + length)
+    cu_seqlens = torch.tensor(bounds, dtype=torch.int32, device=device)
+    return input_ids, cu_seqlens, lengths
+
+
 class _RawWriter:
     """按 prompt 追加写 fp16 裸二进制，支持从断点截断后续写。
 
@@ -175,11 +210,20 @@ class _RawWriter:
     Notes:
         重跑时先 truncate 到记录中的字节偏移，再以追加模式打开：
         中断时可能写了半批，truncate 把它们丢掉，保证文件只含完整的 prompt。
+
+        `resume` 为 None 而文件已有内容时直接抛 `FileExistsError`，不回落到 `wb`。
+        续跑指纹一旦判失败就会走到这条分支，而 `wb` 会把已有特征整体清零，
+        这个代价大到不该由一次误判决定，所以宁可停下让人确认。
     """
 
     def __init__(self, path: Path, dim: int, resume: dict | None = None) -> None:
         self.path = Path(path)
         self.dim = dim
+        if resume is None and self.path.exists() and self.path.stat().st_size > 0:
+            raise FileExistsError(
+                f"{self.path} 已有 {self.path.stat().st_size} 字节，但没有可用的续跑记录。"
+                " 覆盖会丢掉全部已编码特征，请先确认是否真的要重跑。"
+            )
         if resume and self.path.exists():
             with self.path.open("r+b") as handle:
                 handle.truncate(int(resume["bytes"]))
@@ -339,6 +383,109 @@ def _write_progress(path: Path, payload: dict) -> None:
     print(f"[warn] 进度文件被占用，跳过本次写入: {path}", flush=True)
 
 
+def _verify_packed_against_stored(
+    teacher,
+    tokenizer: MossTokenizer,
+    rows: list[dict],
+    lengths: list[int],
+    raw_path: Path,
+    device: torch.device,
+    count: int = 20,
+    min_mean: float = 0.9990,
+    min_token: float = 0.9950,
+) -> dict:
+    """用已写好的特征当基准，检查 packed 前向与旧实现的数值一致性。
+
+    Args:
+        teacher: 已按 packed 装载的 `TeacherEncoder`。
+        tokenizer: 分词器。
+        rows: 全部样本，顺序与 `lengths` 一致。
+        lengths: 已写入 teacher.raw 的每条 token 数。
+        raw_path: 已有特征的裸二进制文件。
+        device: 计算设备。
+        count: 抽前多少条来比。
+        min_mean: 逐条余弦均值的下限。
+        min_token: 单条余弦均值的下限。
+
+    Returns:
+        `{"samples", "tokens", "mean", "min", "max_abs"}`。
+
+    Raises:
+        SystemExit: 读取不完整、分词长度与记录不符、或余弦不达标。
+            调用方必须在创建写入器之前调用它，此时进程退出不会改动任何文件。
+
+    Notes:
+        比对跳过 token 0：它是 attention sink，方向和范数都异常，
+        算进余弦会把结果整体拉高，掩盖正文上的真实偏差。
+    """
+    count = min(count, len(lengths))
+    if count <= 0:
+        raise SystemExit("[verify] 没有已写入的样本可供对拍")
+
+    width = int(teacher.hidden_size)
+    blocks: list[np.ndarray] = []
+    with raw_path.open("rb") as handle:
+        offset = 0
+        for index in range(count):
+            length = int(lengths[index])
+            handle.seek(offset * width * 2)
+            buffer = handle.read(length * width * 2)
+            if len(buffer) != length * width * 2:
+                raise SystemExit(f"[verify] {raw_path} 第 {index} 条读取不完整")
+            blocks.append(np.frombuffer(buffer, dtype=np.float16).reshape(length, width))
+            offset += length
+
+    encoded = [tokenizer.encode(rows[index]["text"]) for index in range(count)]
+    for index, ids in enumerate(encoded):
+        if len(ids) != int(lengths[index]):
+            raise SystemExit(
+                f"[verify] 第 {index} 条重新分词得 {len(ids)} token，"
+                f"记录里是 {lengths[index]}，分词器与当初不一致"
+            )
+
+    bounds = [0]
+    for ids in encoded:
+        bounds.append(bounds[-1] + len(ids))
+    flat = [token for ids in encoded for token in ids]
+    input_ids = torch.tensor(flat, dtype=torch.long, device=device).unsqueeze(0)
+    cu_seqlens = torch.tensor(bounds, dtype=torch.int32, device=device)
+    with torch.inference_mode():
+        hidden = teacher.encode_packed(input_ids, cu_seqlens)
+    got_all = hidden[0].to(torch.float64).cpu().numpy()
+
+    per_prompt: list[float] = []
+    max_abs = 0.0
+    tokens = 0
+    for index, ids in enumerate(encoded):
+        begin = bounds[index]
+        length = len(ids)
+        if length <= 1:
+            continue
+        got = got_all[begin + 1 : begin + length]
+        ref = blocks[index][1:length].astype(np.float64)
+        numerator = (got * ref).sum(axis=1)
+        denominator = np.linalg.norm(got, axis=1) * np.linalg.norm(ref, axis=1) + 1e-12
+        per_prompt.append(float((numerator / denominator).mean()))
+        max_abs = max(max_abs, float(np.abs(got - ref).max()))
+        tokens += length - 1
+
+    if not per_prompt:
+        raise SystemExit("[verify] 抽样全部是单 token 样本，无法比较")
+    metrics = {
+        "samples": len(per_prompt),
+        "tokens": tokens,
+        "mean": float(np.mean(per_prompt)),
+        "min": float(np.min(per_prompt)),
+        "max_abs": max_abs,
+    }
+    if metrics["mean"] < min_mean or metrics["min"] < min_token:
+        raise SystemExit(
+            "[verify] packed 与已写入特征不一致，已中止且未改动任何文件："
+            f"{metrics}"
+        )
+    return metrics
+
+
 def _run_teacher_pass(
     rows: list[dict],
     tokenizer: MossTokenizer,
@@ -346,6 +493,7 @@ def _run_teacher_pass(
     device: torch.device,
     budget: int,
     max_prompts: int,
+    packed: bool = False,
 ) -> tuple[list[int], np.ndarray, float]:
     """teacher 遍：装 9B，逐个 prompt 写 `teacher.raw`。
 
@@ -356,6 +504,7 @@ def _run_teacher_pass(
         device: 计算设备。
         budget: 每批 token 预算。
         max_prompts: 每批最多条数。
+        packed: 为真时把整批拼成一条序列做一次 varlen 前向。
 
     Returns:
         `(lengths, sink 向量, 耗时秒)`。
@@ -384,6 +533,14 @@ def _run_teacher_pass(
 
     start = int(resume["done"]) if resume else 0
     lengths: list[int] = list(resume["lengths"]) if resume else []
+    if resume:
+        # 续跑前留一份进度快照。之后要是指纹或字节数对不上，
+        # 靠这份 .bak 还能手工找回偏移，而不是只能从头再来。
+        backup = progress_path.with_name(progress_path.name + ".bak")
+        try:
+            backup.write_bytes(progress_path.read_bytes())
+        except OSError as error:
+            print(f"[teacher] 进度备份失败，继续执行: {error}", flush=True)
     sink_sum = (
         np.load(sink_path).astype(np.float64)
         if resume and sink_path.exists()
@@ -392,31 +549,61 @@ def _run_teacher_pass(
     sink_count = int(resume["sink_count"]) if resume else 0
 
     remaining = rows[start:]
-    batches = make_batches(remaining, budget, max_prompts)
+    batches = make_batches(remaining, budget, max_prompts, packed=packed)
     total = sum(row["n_tokens"] for row in rows)
     started = time.time()
-    teacher = TeacherEncoder(TEACHER_CKPT, TEACHER_CFG, device=device)
+    teacher = TeacherEncoder(TEACHER_CKPT, TEACHER_CFG, device=device, packed=packed)
     print(
         f"[teacher] 就位 {time.time() - started:.1f}s，显存 {torch.cuda.memory_allocated()/1e9:.2f} GB"
         + (f"，从第 {start} 条续跑" if start else ""),
         flush=True,
     )
 
+    if packed and start > 0:
+        metrics = _verify_packed_against_stored(
+            teacher, tokenizer, rows, lengths, out_dir / "teacher.raw", device
+        )
+        print(
+            f"[teacher] packed 对拍通过：{metrics['samples']} 条 / {metrics['tokens']:,} token，"
+            f"余弦均值 {metrics['mean']:.6f} 最小 {metrics['min']:.6f}，"
+            f"最大绝对差 {metrics['max_abs']:.4f}",
+            flush=True,
+        )
+
     done = int(sum(lengths))
     written = start
     with _RawWriter(out_dir / "teacher.raw", teacher.hidden_size, resume) as writer:
         for index, batch in enumerate(batches, 1):
-            input_ids, attention_mask, batch_lengths = pad_batch(batch, tokenizer, device)
-            with torch.inference_mode():
-                hidden = teacher.encode(input_ids, attention_mask)
-            # 直接转 fp16 再回 CPU：落盘就是 fp16，先转 fp32 等于把 PCIe 传输量翻倍。
-            hidden_np = hidden.to(torch.float16).cpu().numpy()
-            # sink 必须用转换前的值累加：token 0 的范数远大于正文，
-            # 先压成 fp16 再累加会引入舍入误差，极端情况还会溢出成 inf。
-            sink_rows = hidden[:, 0].to(torch.float64).cpu().numpy()
+            if packed:
+                input_ids, cu_seqlens, batch_lengths = pack_batch(batch, tokenizer, device)
+                with torch.inference_mode():
+                    hidden = teacher.encode_packed(input_ids, cu_seqlens)
+                begins = cu_seqlens[:-1].tolist()
+                # sink 必须在压成 fp16 之前取：token 0 的范数远大于正文，
+                # 先压再累加会引入舍入误差，极端情况还会溢出成 inf。
+                sink_rows = hidden[0, torch.tensor(begins, device=device)].to(
+                    torch.float64
+                ).cpu().numpy()
+                hidden_np = hidden.to(torch.float16).cpu().numpy()
+                row_blocks = [
+                    hidden_np[0, begin : begin + length]
+                    for begin, length in zip(begins, batch_lengths)
+                ]
+            else:
+                input_ids, attention_mask, batch_lengths = pad_batch(batch, tokenizer, device)
+                with torch.inference_mode():
+                    hidden = teacher.encode(input_ids, attention_mask)
+                # 直接转 fp16 再回 CPU：落盘就是 fp16，先转 fp32 等于把 PCIe 传输量翻倍。
+                hidden_np = hidden.to(torch.float16).cpu().numpy()
+                # sink 必须用转换前的值累加：token 0 的范数远大于正文，
+                # 先压成 fp16 再累加会引入舍入误差，极端情况还会溢出成 inf。
+                sink_rows = hidden[:, 0].to(torch.float64).cpu().numpy()
+                row_blocks = [
+                    hidden_np[row_index, :length]
+                    for row_index, length in enumerate(batch_lengths)
+                ]
             for row_index, length in enumerate(batch_lengths):
-                row = hidden_np[row_index, :length]
-                writer.add(row)
+                writer.add(row_blocks[row_index])
                 sink_sum += sink_rows[row_index]
                 sink_count += 1
                 lengths.append(length)
@@ -643,6 +830,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--prompts", type=Path, default=Path("dataset/prompts.jsonl"))
     parser.add_argument("--out", type=Path, default=Path("dataset/features/v1"))
     parser.add_argument("--teacher-budget", type=int, default=4096, help="teacher 批 token 预算")
+    parser.add_argument(
+        "--packed",
+        action="store_true",
+        help="把整批拼成一条序列做 varlen 前向，不补 padding；需要 flash-attn",
+    )
     parser.add_argument("--student-budget", type=int, default=0, help="student 批 token 预算；0 表示按显存自动推断")
     parser.add_argument("--teacher-max-prompts", type=int, default=64, help="teacher 每批最多条数")
     parser.add_argument("--student-max-prompts", type=int, default=256, help="student 每批最多条数")
@@ -724,6 +916,7 @@ def main(argv: list[str] | None = None) -> int:
             device,
             args.teacher_budget,
             args.teacher_max_prompts,
+            packed=args.packed,
         )
     if args.teacher_only:
         # 微调时学生是从文本现算的，student.raw 只在求 Ridge 初值时才用得上；
