@@ -253,6 +253,7 @@ def _resume_valid(
     settings: dict,
     raw_path: Path,
     sidecar: Path | None = None,
+    row_lengths: list[int] | None = None,
 ) -> bool:
     """判断旧进度能否继续使用。
 
@@ -262,6 +263,7 @@ def _resume_valid(
         settings: 影响特征含义的设置（taps / 模型目录 / 量化文件等）。
         raw_path: 特征裸文件。
         sidecar: 可选伴随文件（teacher 的 sink 累计）。
+        row_lengths: 当前样本集每条 prompt 的 token 数，用于判断「只在末尾追加」。
 
     Returns:
         True 表示可以从记录位置续写。
@@ -269,9 +271,19 @@ def _resume_valid(
     Notes:
         只比对条数是不够的：样本内容变了、taps 变了、换了量化权重，
         旧进度都会命中，续写出的文件会变成混步长或混模型的坏数据喵。
+
+        指纹不一致时还允许一种情况：新样本集是旧样本集的前缀扩展，
+        即前 `len(progress["lengths"])` 条逐项相同、只是末尾多了几条。
+        这时旧 raw 的每一行仍然对得上，续写只会追加新样本喵。
     """
     if progress.get("fingerprint") != fingerprint:
-        return False
+        old_lengths = progress.get("lengths")
+        if row_lengths is None or old_lengths is None:
+            return False
+        if len(row_lengths) <= len(old_lengths):
+            return False
+        if list(old_lengths) != list(row_lengths[: len(old_lengths)]):
+            return False
     if progress.get("settings") != settings:
         return False
     if not raw_path.is_file():
@@ -363,6 +375,7 @@ def _run_teacher_pass(
         settings={},
         raw_path=out_dir / "teacher.raw",
         sidecar=sink_path,
+        row_lengths=[int(row["n_tokens"]) for row in rows],
     ):
         # 样本集、设置或磁盘产物对不上，进度作废，从头来。
         resume = None
@@ -490,6 +503,7 @@ def _run_student_pass(
         fingerprint=fingerprint,
         settings=settings,
         raw_path=out_dir / "student.raw",
+        row_lengths=[int(row["n_tokens"]) for row in rows],
     ):
         resume = None
         progress_path.unlink(missing_ok=True)
