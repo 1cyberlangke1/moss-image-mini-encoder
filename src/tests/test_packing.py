@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from moss_small_encoder.packing import packed_forward_kwargs, packing_metadata
-from moss_small_encoder.train.finetune import PAD_ID, build_packed_batches, make_packed_batch
+from moss_small_encoder.train.finetune import PAD_ID, build_length_batches, build_packed_batches, make_packed_batch
 
 
 class _FakeTokenizer:
@@ -104,6 +104,29 @@ def test_make_packed_batch_offsets_and_teacher_trim() -> None:
     assert flat_ids.tolist() == [[1, 2, 3, 4, 5]]
     assert cu_seqlens.tolist() == [0, 3, 5]
     assert [t.shape[0] for t in kept] == [3, 2]
+
+
+def test_length_batches_respect_aspect_and_budget() -> None:
+    """补齐批要同时守住长度比与补齐后预算喵。
+
+    输入: 长度从 1 到 900 混排的下标
+    输出: `build_length_batches` 的批次
+    预期: 每批最长/最短不超过 3.0，每批「条数乘最长」不超过预算，
+          且所有下标恰好出现一次喵
+    """
+    lengths = [1, 2, 3, 8, 20, 21, 60, 200, 900] * 6
+    indices = list(range(len(lengths)))
+    batches = build_length_batches(
+        indices, lengths, 2048, np.random.default_rng(0), max_aspect=3.0
+    )
+
+    for batch in batches:
+        lo = min(lengths[i] for i in batch)
+        hi = max(lengths[i] for i in batch)
+        assert hi <= lo * 3.0
+        assert len(batch) * hi <= 2048
+
+    assert sorted(x for batch in batches for x in batch) == indices
 
 
 def test_make_packed_batch_pads_to_fixed_length() -> None:

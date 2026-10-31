@@ -447,41 +447,53 @@ def build_length_batches(
     budget: int,
     rng: np.random.Generator,
     max_prompts: int = 256,
+    max_aspect: float = 3.0,
 ) -> list[list[int]]:
     """把 prompt 下标切成若干批，按**padding 后**的 token 数控制预算喵。
 
-    输入: 候选下标、每条 token 数、单批「条数 x 批内最长」上限、随机数发生器、单批条数上限
-    输出: 批次列表，每批 `len(batch) * max(lengths in batch) <= budget`
+    输入: 候选下标、每条 token 数、单批「条数 x 批内最长」上限、随机数发生器、
+        单批条数上限、批内最长/最短长度比上限
+    输出: 批次列表，每批 `len(batch) * max(lengths in batch) <= budget`，
+        且批内 `最长 / 最短 <= max_aspect`
     预期: 显存占用可预测；同批长度接近，padding 浪费小喵
 
     Notes:
         显存吃的是 `B x T_max`，不是真实 token 总和喵。
         按真实 token 数分批，短句桶里 200 条各 20 token 会被 pad 到 127，
         实际激活 25,400 token（超预算 6 倍），第一次前向就 CUDA OOM喵。
+        只按长度桶分组不够：桶宽 32 时，1 token 和 32 token 仍会同批，
+        补齐到 32 之后 1 token 的那条白烧 31 份算力。所以这里再按
+        最长/最短比卡一次，取值与编码侧 `make_batches` 保持一致喵。
     """
-    keys = []
-    for idx in indices:
-        bucket = int(lengths[idx]) // 32
-        keys.append((bucket, float(rng.random()), idx))
-    keys.sort()
+    order = sorted(indices, key=lambda i: (int(lengths[i]), float(rng.random())))
 
     batches: list[list[int]] = []
     batch: list[int] = []
     longest = 0
-    for _, _, idx in keys:
+    shortest = 0
+    for idx in order:
         n = int(lengths[idx])
         new_longest = max(longest, n)
-        too_big = batch and ((len(batch) + 1) * new_longest > budget
-                             or len(batch) + 1 > max_prompts)
+        new_shortest = min(shortest, n) if batch else n
+        too_big = bool(batch) and (
+            (len(batch) + 1) * new_longest > budget
+            or len(batch) + 1 > max_prompts
+            or new_longest > new_shortest * max_aspect
+        )
         if too_big:
             batches.append(batch)
-            batch, longest = [], 0
+            batch, longest, shortest = [], 0, 0
             new_longest = n
+            new_shortest = n
         batch.append(idx)
         longest = new_longest
+        shortest = new_shortest
     if batch:
         batches.append(batch)
-    return batches
+
+    # 批内已经按长度排好，但批与批之间要打乱，否则长度单调下降
+    order_of_batches = rng.permutation(len(batches))
+    return [batches[i] for i in order_of_batches]
 
 
 @torch.no_grad()
