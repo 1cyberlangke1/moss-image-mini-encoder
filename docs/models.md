@@ -16,20 +16,20 @@
 # 查看所有支持的模型条目清单
 python src/scripts/download_models.py --list
 
-# 下载训练依赖组件（教师模型 + 0.8B 学生 + 分词器）
+# 下载训练依赖组件（教师模型 + 0.8B / 2B / 4B 学生 + 分词器）
 python src/scripts/download_models.py --dest models
 
-# 追加下载指定学生模型（如 4B 学生）
+# 只下载指定学生模型（如只下 4B，此时不含教师与分词器）
 python src/scripts/download_models.py --dest models --only student-4b
 
 # 下载 ComfyUI 出图所需完整底模套件（可直接指定至 ComfyUI 根目录下的 models）
 python src/scripts/download_models.py --dest <ComfyUI路径>/models --group comfy
 
-# 校验已下载文件的 SHA256 完整性（不触发重复下载）
+# 校验已下载的文件（LFS 比 SHA256，非 LFS 比字节数；不触发重复下载）
 python src/scripts/download_models.py --dest models --check
 ```
 
-*各文件下载锁定在固定的 Hugging Face Commit SHA 节点，并在下载完成后自动执行 SHA256 完整性校验。*
+*各文件下载锁定在固定的 Hugging Face Commit SHA 节点；LFS 文件校验 SHA256，非 LFS 文件只校验字节数。*
 
 ---
 

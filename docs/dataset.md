@@ -10,6 +10,10 @@
 # 下载依赖与分词器
 python src/scripts/download_models.py
 
+# 让 Python 找得到 src 布局里的包（二选一）
+pip install -e .
+# export PYTHONPATH=src    # PowerShell: $env:PYTHONPATH="src"
+
 # 执行语料清洗、分词与分桶构建
 python -m moss_small_encoder.build --config src/configs/dataset_v1.yaml
 ```

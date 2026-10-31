@@ -30,7 +30,7 @@ New-Item -ItemType Junction `
 
 | 目录路径 | 放置内容 | 说明 |
 |---|---|---|
-| `ComfyUI/models/text_encoders/` | Qwen3.5 学生模型权重 | 支持 0.8B / 2B / 4B 的 bf16、int8 或 w4a8 格式 |
+| `ComfyUI/models/text_encoders/` | Qwen3.5 学生模型权重 | 0.8B / 2B 提供 bf16、int8、w4a8 三档；4B 仅提供 w4a8 |
 | `ComfyUI/models/moss_encoder_adapters/` | 投影适配器文件 | 对应档位的 `.safetensors` 文件 |
 
 *注：`models/moss_encoder_adapters/` 目录在节点初次加载时会自动创建。*

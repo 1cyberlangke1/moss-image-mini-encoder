@@ -6,7 +6,7 @@ MOSS-Image 官方默认的 9B 文本编码器体积较大，在消费级显卡�
 
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-moss--image--mini--encoder-ffd21e.svg)](https://huggingface.co/cyberlangke/moss-image-mini-encoder)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.10%2B-3776ab.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.11%2B-3776ab.svg)](https://www.python.org/)
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-%E2%89%A50.42.0-4b8bbe.svg)](https://github.com/comfyanonymous/ComfyUI)
 
 ---
@@ -15,7 +15,7 @@ MOSS-Image 官方默认的 9B 文本编码器体积较大，在消费级显卡�
 
 所有档位均基于相同的 9B 教师模型及 6 层特征抽头（第 2 / 4 / 8 / 12 / 16 层与最后一层）训练。可根据实际显存预算选择合适的模型规格与量化版本：
 
-| 学生模型 | 权重格式 | 模型权重体积 | 适配器体积 | 适配器显存估算 | 说明 |
+| 学生模型 | 权重格式 | 模型权重体积 | 适配器体积 | 学生+适配器显存估算 | 说明 |
 |---|---|---:|---:|---:|---|
 | **0.8B** | bf16 | 1.63 GB | 48.1 MB | ~1.80 GB | 全精度版，适合对比验证 |
 | **0.8B** | int8 | 1.15 GB | 48.1 MB | ~1.25 GB | 基础量化版 |
@@ -23,7 +23,7 @@ MOSS-Image 官方默认的 9B 文本编码器体积较大，在消费级显卡�
 | **2B** | bf16 | 4.24 GB | 96.1 MB | ~4.50 GB | 全精度版 |
 | **2B** | int8 | 2.90 GB | 96.1 MB | ~3.10 GB | 基础量化版 |
 | **2B** | w4a8 | 2.32 GB | 96.1 MB | ~2.50 GB | 速度与显存均衡档位 |
-| **4B** | w4a8 | 3.75 GB | 120.1 MB | ~3.75 GB | 效果最接近 9B 档位 |
+| **4B** | w4a8 | 3.75 GB | 120.1 MB | ~3.87 GB | 效果最接近 9B 档位 |
 
 > ⚠️ **匹配注意事项**：不同尺寸的学生模型（0.8B / 2B / 4B）特征维度不同，**不可跨尺寸混用**（会报维度错误）；同尺寸下的不同量化格式（如 bf16 / int8 / w4a8）具有相同的维度可正常加载，但交叉使用可能导致特征轻微漂移、可能会影响生成效果，建议优先搭配对应量化版本的专属适配器。
 
