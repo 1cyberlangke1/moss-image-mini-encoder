@@ -786,7 +786,8 @@ def self_check(
     """训练前自检喵。
 
     输入: 未挂 LoRA 的主干、分词器、样本、教师特征、配置
-    输出: 含 `lora_max_diff`、`cka`、`cka_numpy` 的字典
+    输出: 含 `lora_max_diff`、`cka`、`cka_numpy` 的字典，`cka` 与 `cka_numpy`
+        都是损失口径 `1 − √CKA`
     预期: `lora_max_diff` 为 0.0（LoRA 零初始化不改变输出），
           且训练路径的 CKA 与 numpy 独立实现相差小于 1e-4
     """
@@ -827,13 +828,15 @@ def self_check(
     ys = ys - ys.mean(axis=0, keepdims=True)
     cross = np.linalg.norm(ys.T @ xs, "fro")
     den = np.sqrt(np.linalg.norm(xs.T @ xs, "fro") * np.linalg.norm(ys.T @ ys, "fro"))
+    # `distill_loss` 返回的是损失口径 `1 − √CKA`，这里必须换算到同一口径再比喵
     cka_numpy = float((cross / den) ** 2)
+    cka_numpy_loss = 1.0 - float(np.sqrt(cka_numpy))
 
     _, parts = distill_loss(hidden, teacher_flat, config)
     parts["lora_max_diff"] = max_diff
     parts["trainable"] = float(trainable)
     parts["total"] = float(total)
-    parts["cka_numpy"] = cka_numpy
+    parts["cka_numpy"] = cka_numpy_loss
     return parts
 
 
