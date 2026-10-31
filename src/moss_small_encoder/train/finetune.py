@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -209,7 +211,9 @@ def make_batch(
         if len(ids) != teacher.shape[0]:
             continue
         seqs.append(torch.tensor(ids[1:], dtype=torch.long))
-        kept_teachers.append(torch.from_numpy(teacher[1:].astype(np.float32)))
+        # 保持 fp16 上卡：CPU 上转 fp32 要多花一趟约 67 MB 的转换，
+        # 而且 PCIe 传输量翻倍；fp32 提升留到 GPU 上做，几乎不花时间喵
+        kept_teachers.append(torch.from_numpy(teacher[1:]))
     if not seqs:
         raise RuntimeError("没有一条样本的 token 数与特征对齐喵")
 
@@ -402,6 +406,71 @@ def evaluate_cka(
     return sum_cka / max(n_tok, 1)
 
 
+class _BatchPrefetcher:
+    """在后台线程准备训练批，让读盘与分词和 GPU 计算重叠喵。
+
+    输入: 特征读取器、分词器、文本表、可选的预分词缓存、批次列表
+    输出: 迭代 `(batch, prepared)`；`prepared` 为 `None` 表示该批 token 数与特征对不上
+    预期: 主线程拿到 CPU 张量后立刻上卡，后台同时准备下一批；
+          后台只做 CPU 侧工作、不碰 CUDA，避免多线程上下文问题喵
+    """
+
+    def __init__(
+        self,
+        reader: "PromptFeatureReader",
+        tokenizer,
+        texts: list[str],
+        id_cache: "IdCache | None",
+        batches,
+        depth: int = 2,
+    ) -> None:
+        self._queue: queue.Queue = queue.Queue(maxsize=depth)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._produce,
+            args=(reader, tokenizer, texts, id_cache, batches),
+            daemon=True,
+        )
+
+    def start(self) -> "_BatchPrefetcher":
+        """启动后台线程并返回自身喵。"""
+        self._thread.start()
+        return self
+
+    def _produce(self, reader, tokenizer, texts, id_cache, batches) -> None:
+        """后台循环：读一批、分一批、塞进队列喵。
+
+        输入: 读取器、分词器、文本表、预分词缓存、批次列表
+        输出: 无（写队列）
+        预期: 队列满时阻塞等主线程取走；结束时塞一个 `None` 当哨兵喵
+        """
+        for batch in batches:
+            if self._stop.is_set():
+                break
+            teachers = reader.read(batch)
+            id_seqs = [id_cache.get(i) for i in batch] if id_cache is not None else None
+            try:
+                prepared = make_batch(
+                    tokenizer, [texts[i] for i in batch], teachers, id_seqs
+                )
+            except RuntimeError:
+                prepared = None
+            self._queue.put((batch, prepared))
+        self._queue.put((None, None))
+
+    def __iter__(self):
+        """按批产出 `(batch, prepared)`，遇到哨兵结束喵。"""
+        while True:
+            batch, prepared = self._queue.get()
+            if batch is None:
+                return
+            yield batch, prepared
+
+    def stop(self) -> None:
+        """通知后台线程停下喵。"""
+        self._stop.set()
+
+
 def train_finetune(
     model,
     tokenizer,
@@ -446,18 +515,17 @@ def train_finetune(
 
     while step < config.steps:
         batches = build_length_batches(train_idx, reader.lengths, config.batch_tokens, rng)
-        for batch in batches:
+        prefetcher = _BatchPrefetcher(
+            reader, tokenizer, texts, id_cache, batches
+        ).start()
+        for _batch, prepared in prefetcher:
             if step >= config.steps:
+                prefetcher.stop()
                 break
-            teachers = reader.read(batch)
-            try:
-                id_seqs = [id_cache.get(i) for i in batch] if id_cache is not None else None
-                input_ids, mask, kept = make_batch(
-                    tokenizer, [texts[i] for i in batch], teachers, id_seqs
-                )
-            except RuntimeError:
+            if prepared is None:
                 skipped += 1
                 continue
+            input_ids, mask, kept = prepared
             input_ids = input_ids.to(device)
             mask = mask.to(device)
 

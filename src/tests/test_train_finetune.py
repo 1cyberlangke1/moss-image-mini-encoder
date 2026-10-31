@@ -15,6 +15,7 @@ import torch
 from moss_small_encoder.train.finetune import (
     PAD_ID,
     FinetuneConfig,
+    _BatchPrefetcher,
     distill_loss,
     make_batch,
 )
@@ -98,6 +99,60 @@ def test_make_batch_raises_when_nothing_left() -> None:
     teachers = [np.zeros((9, 4), dtype=np.float16)]
     with pytest.raises(RuntimeError):
         make_batch(tok, ["abc"], teachers)
+
+
+class FakeReader:
+    """假特征读取器：按给定长度返回全零 fp16 特征喵。
+
+    输入: 每条 prompt 的 token 数、教师维度
+    输出: `read(indices)` 返回等长的 fp16 数组列表
+    预期: 只用于验证批次编排，不做任何真实 IO喵
+    """
+
+    def __init__(self, lengths: list[int], d_out: int = 4) -> None:
+        self.lengths = lengths
+        self._d = d_out
+
+    def read(self, indices):
+        return [
+            np.zeros((self.lengths[i], self._d), dtype=np.float16) for i in indices
+        ]
+
+
+def test_prefetcher_yields_batches_in_order() -> None:
+    """后台预取必须按输入顺序产出，且 prepared 能直接喂给训练循环喵。
+
+    输入: 两条长度分别为 3 和 4 的文本、一个含两条的批
+    输出: `_BatchPrefetcher` 迭代结果
+    预期: 只产出一批，批下标与输入一致，prepared 含 ids/mask/kept 三件喵
+    """
+    tokenizer = FakeTokenizer()
+    texts = ["abc", "defg"]
+    reader = FakeReader([3, 4])
+    prefetcher = _BatchPrefetcher(reader, tokenizer, texts, None, [[0, 1]]).start()
+
+    out = list(prefetcher)
+
+    assert len(out) == 1
+    batch, prepared = out[0]
+    assert batch == [0, 1]
+    assert prepared is not None
+    input_ids, mask, kept = prepared
+    assert input_ids.shape[0] == 2
+    assert mask.shape == input_ids.shape
+    assert len(kept) == 2
+
+
+def test_prefetcher_marks_mismatched_batch() -> None:
+    """token 数与特征行数对不上时，该批必须被标记为 None 而不是抛异常喵。"""
+    tokenizer = FakeTokenizer()
+    reader = FakeReader([99])
+    prefetcher = _BatchPrefetcher(reader, tokenizer, ["abc"], None, [[0]]).start()
+
+    out = list(prefetcher)
+
+    assert len(out) == 1
+    assert out[0][1] is None
 
 
 def test_distill_loss_matches_numpy_reference() -> None:
