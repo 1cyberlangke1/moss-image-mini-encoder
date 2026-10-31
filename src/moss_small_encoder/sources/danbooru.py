@@ -15,6 +15,7 @@ import argparse
 import csv
 import json
 import random
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -77,16 +78,36 @@ CHARACTER_TEMPLATES = [
     "{x}，特写",
     "{x}，远景",
     "{x}，站姿，全身",
-    "{x}，黄昏，街景",
-    "{x}，室内，柔和光线",
     "{x}，侧面，半身",
     "画一张{x}",
+    "{x}，图书馆里看书",
+    "{x}，教室里坐着",
+    "{x}，便利店里买饮料",
+    "{x}，公园长椅上",
+    "{x}，地铁车厢里",
+    "{x}，天台上",
+    "{x}，走廊里站着",
+    "{x}，咖啡店里",
+    "{x}，海边散步",
+    "{x}，厨房做饭",
+    "{x}，雨中撑伞",
+    "{x}，雪地里",
+    "{x}，森林里",
+    "{x}，街道上",
+    "{x}，卧室里",
+    "{x}，阳台上",
+    "{x}，车站里",
+    "{x}，书店里",
+    "{x}，超市里",
+    "{x}，球场上",
 ]
 
 # Danbooru 的 category 编号：0 通用、1 画师、3 作品、4 角色、5 meta
 CATEGORY_GENERAL = 0
+CATEGORY_ARTIST = 1
 CATEGORY_SERIES = 3
 CATEGORY_CHARACTER = 4
+CATEGORY_META = 5
 
 
 def _opener(proxy: str) -> urllib.request.OpenerDirector:
@@ -395,6 +416,148 @@ def iter_characters(
                 kind="positive",
                 meta={"character": raw, "post_count": character["post_count"]},
             )
+
+
+ARTIST_TEMPLATES = (
+    "best quality, highres, 1girl, solo, @{a}",
+    "best quality, highres, 1boy, solo, @{a}",
+    "best quality, highres, scenery, no humans, @{a}",
+    "best quality, highres, 1girl, upper body, @{a}",
+)
+
+QUALITY_TAGS = ("best quality", "highres")
+
+
+def iter_artists(
+    tags_path: Path,
+    per_artist: int,
+    seed: int = 20261027,
+    max_artists: int | None = None,
+    min_post_count: int = 0,
+    templates: tuple[str, ...] | None = None,
+) -> Iterator[Record]:
+    """按画师展开变体，只给画师名，不给任何属性词喵。
+
+    输入: tags_path 全库 tag 清单；per_artist 每个画师多少条；
+          max_artists 上限；min_post_count 热度下限
+    输出: `Record` 流，source 为 `danbooru`
+    预期: 每个画师都被覆盖；同一画师的变体共享 source_id 前缀
+
+    Notes:
+        画师 tag 在 danbooru 里是裸名，官方示例写成 `@foo bar`，
+        所以这里统一加 `@` 前缀，让教师看到的是「画师引用」而不是普通物件喵。
+
+        主体固定在 1girl / 1boy / scenery 三种，
+        不随机抽通用属性：随机属性会把画师的风格信号冲掉喵。
+    """
+    tags = load_tags(tags_path)
+    artists = [r for r in tags if r["category"] == CATEGORY_ARTIST]
+    if min_post_count:
+        artists = [r for r in artists if r["post_count"] >= min_post_count]
+    artists.sort(key=lambda r: (-r["post_count"], r["name"]))
+    if max_artists is not None:
+        artists = artists[:max_artists]
+    if not artists:
+        raise ValueError("tag 清单里没有画师，检查下载是否完整")
+
+    slots = templates or ARTIST_TEMPLATES
+    for artist in artists:
+        raw = artist["name"]
+        readable = _pretty(raw)
+        variants = [t.format(a=readable) for t in slots]
+        if raw != readable:
+            variants += [t.format(a=raw) for t in slots]
+        picked = _sample_strings(variants, per_artist, f"{raw}|artist|{seed}")
+        for index, text in enumerate(picked):
+            yield Record(
+                text=text,
+                source="danbooru",
+                source_id=f"{artist['id']}:a{index:03d}",
+                lang="en",
+                nsfw=None,
+                kind="positive",
+                meta={"artist": raw, "post_count": artist["post_count"]},
+            )
+
+
+# meta 类（category 5）几乎全是标注动作与画质标记，不是画面内容，
+# 官方推荐顺序里的 Meta 一档因此在 danbooru 词表上无对应，整档跳过喵。
+
+def _usable_general(name: str) -> bool:
+    """过滤掉纯标点、纯数字这类没法当画面描述的 general tag喵。
+
+    输入: tag 名
+    输出: 能不能用
+    预期: 必须含至少一个 ASCII 字母，且首字符必须是字母喵
+    """
+    if not name or not name[0].isalpha():
+        return False
+    return any(ch.isalpha() and ch.isascii() for ch in name)
+
+
+def iter_tag_sequences(
+    tags_path: Path,
+    count: int,
+    seed: int = 20261027,
+    min_post_count: int = 50,
+) -> Iterator[Record]:
+    """按官方推荐顺序拼真实 tag 序列喵。
+
+    输入: tags_path；count 条数；min_post_count 各分组热度下限
+    输出: `Record` 流
+    预期: 顺序恒为 quality -> year -> artist -> general
+
+    Notes:
+        官方例子是 `best quality, highres, hatsune miku, vocaloid, @foo bar, 1girl,
+        blue hair`，顺序照它，写错了模型认不出来喵。
+
+        官方顺序里还有 Score 与 Meta 两档，在 danbooru 词表上没有对应：
+        `score_9` 属于别的词表体系，meta 类几乎全是 `tagme` / `bad_id` /
+        `costume_request` 这种标注动作。硬塞进来等于教模型两个不存在的字段，
+        所以这两档整档跳过喵。
+
+        **这里不放 Character / Series**：general tag 是随机抽的，
+        给 `kayoko_(blue_archive)` 配上 `blonde_hair` 会把错误绑定喂进教师，
+        和角色桶「只给名字、属性由教师提供」的原则直接冲突喵。
+        角色的名字绑走 `characters` 与 `characters_cn` 两个桶喵。
+
+        其余每个 tag 都取自 danbooru 真实词表，一个都不是我们编的喵。
+        `min_post_count` 挡掉 0 帖死 tag（全库 82% 的 general 是 0 帖）喵。
+    """
+    tags = load_tags(tags_path)
+    pool = [r for r in tags if r["post_count"] >= min_post_count]
+    general = [
+        r["name"]
+        for r in pool
+        if r["category"] == CATEGORY_GENERAL and _usable_general(r["name"])
+    ]
+    # 年份只收 2010 以后的：danbooru 里 1945 这类数字 tag 是别的东西，不是创作年份喵
+    years = [
+        r["name"]
+        for r in tags
+        if re.fullmatch(r"(201\d|202\d)", r["name"]) and r["post_count"] >= 1000
+    ]
+    artists = [r["name"] for r in pool if r["category"] == CATEGORY_ARTIST]
+    if not general:
+        raise ValueError("tag 清单里没有足够通用 tag")
+
+    rng = random.Random(seed)
+    for index in range(count):
+        parts = list(QUALITY_TAGS)
+        if years and rng.random() < 0.4:
+            parts.append(rng.choice(years))
+        if artists and rng.random() < 0.6:
+            parts.append("@" + _pretty(rng.choice(artists)))
+        parts.extend(rng.sample(general, min(rng.randint(5, 9), len(general))))
+        yield Record(
+            text=", ".join(parts),
+            source="danbooru",
+            source_id=f"tagseq:{index:06d}",
+            lang="en",
+            nsfw=None,
+            kind="positive",
+            meta={"n_tags": len(parts)},
+        )
 
 
 def _sample_strings(pool: list[str], count: int, salt: str) -> list[str]:

@@ -91,21 +91,52 @@ buckets:
 
   # ---- 第二代新增：实体桶 ----
   # 只给名字，不给外观描述。实体名来自 Wikidata，类型 QID 由锚点实测确定。
-  # min_sitelinks=0 表示低频实体也要，不做热度截断。
+  # min_sitelinks>=1：sitelinks=0 的实体一个语言版本都没有，画不出任何东西喵。
   - name: entity
     kind: enumerate
     entities: dataset/wikidata/entities.jsonl
-    per_entity: 8
-    min_sitelinks: 0
+    per_entity: 1
+    min_sitelinks: 1
     quota: 2000000
 
   # ---- 第二代新增：二次元角色桶 ----
-  # 名字来自 danbooru 的 character tag，低频角色也要（min_post_count=0）。
+  # 名字来自 danbooru 的 character tag，只要 post_count >= 10 的喵。
+  # 0-9 帖的 tag 一个帖子都没对应，教师给不出任何视觉信息，学了等于学噪音喵。
   # 同样只给名字、不配属性词：随机属性会给黑发角色配 blonde_hair，
   # 把错误绑定喂进教师喵。
   - name: characters
     kind: characters
     tags: dataset/danbooru_api/tags.jsonl
-    per_character: 8
-    min_post_count: 0
+    per_character: 1
+    min_post_count: 10
     quota: 2000000
+
+  # ---- 第二代新增：中文专名桶 ----
+  # 中文译名来自 ffdkj 的 danbooru tag 中英对照表（MIT，只收 post_count>=10 的 tag）。
+  # 文本只用中文名，不拼英文 tag、不写外观词：属性由教师看到名字后自己产生的隐状态提供喵。
+  # 实测 9B 对不带作品名的名字会把它画成画面上的文字，所以中文名必须带作品名（表里已含）喵。
+  - name: characters_cn
+    kind: characters_cn
+    tags_cn: dataset/danbooru_cn/tags.csv
+    per_character: 1
+    min_post_count: 10
+    quota: 2000000
+
+  # ---- 第二代新增：画师桶 ----
+  # 画师 tag 在 danbooru 里是裸名，官方示例写作 `@foo bar`，这里统一加 @ 前缀喵。
+  # 主体固定 1girl/1boy/scenery，不随机抽属性：随机属性会把画师风格信号冲掉喵。
+  - name: artists
+    kind: artists
+    tags: dataset/danbooru_api/tags.jsonl
+    per_artist: 1
+    min_post_count: 10
+    quota: 2000000
+
+  # ---- 第二代新增：tag 序列桶 ----
+  # 顺序严格按官方用户指南：quality -> score -> meta -> year -> character -> series -> artist -> general喵。
+  # 每个 tag 都取自 danbooru 真实词表；min_post_count=50 挡掉 0 帖死 tag（全库 82% 的 general 是 0 帖）喵。
+  - name: tag_seq
+    kind: tag_seq
+    tags: dataset/danbooru_api/tags.jsonl
+    min_post_count: 50
+    quota: 30000

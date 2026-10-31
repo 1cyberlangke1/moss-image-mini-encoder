@@ -146,19 +146,43 @@ def fetch_qids(
         为什么不带 label：`ORDER BY` + `OPTIONAL rdfs:label` 会把 WDQS 压到
         504（实测企业类必崩）。拆成两步后，这一步只做带索引的 P31 扫描喵。
     """
-    if cache is not None and cache.is_file():
-        cached: list[tuple[str, int]] = []
-        with cache.open("r", encoding="utf-8") as fp:
-            for line in fp:
-                row = json.loads(line)
-                cached.append((row["qid"], row["sitelinks"]))
-        print(f"  读到 ID 缓存 {len(cached):,} 个 -> {cache}", flush=True)
-        return cached
-
     floor = f"FILTER(?n >= {min_sitelinks})" if min_sitelinks else ""
     found: list[tuple[str, int]] = []
     empty_streak = 0
     lo = 0
+
+    # 增量落盘：每片扫完就写，进程被杀也不会丢掉已扫的片喵。
+    # 进度文件记录「下一片从哪个 QID 开始」和「是否已扫完」，续跑直接从断点接。
+    progress_path = None
+    if cache is not None:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        progress_path = cache.with_suffix(".progress")
+        if cache.is_file():
+            with cache.open("r", encoding="utf-8") as fp:
+                for line in fp:
+                    row = json.loads(line)
+                    found.append((row["qid"], row["sitelinks"]))
+            if not progress_path.is_file():
+                # 旧格式缓存（没有 progress）：旧代码是一次性写完整个文件的，
+                # 这种情况必须当成已完成直接返回；否则会从 0 重扫并逐片追加，
+                # 缓存直接翻倍——实测把 138,366 写成了 276,731喵
+                print(f"  读到旧格式完整缓存 {len(found):,} 个 -> {cache}", flush=True)
+                return found
+            done = False
+            resume_from = 0
+            try:
+                meta = json.loads(progress_path.read_text(encoding="utf-8"))
+                done = bool(meta.get("done"))
+                resume_from = int(meta.get("next_lo", 0))
+            except Exception:
+                done = False
+            if done:
+                print(f"  读到完整 ID 缓存 {len(found):,} 个 -> {cache}", flush=True)
+                return found
+            lo = resume_from
+            print(f"  读到部分 ID 缓存 {len(found):,} 个，从 QID={lo:,} 续扫", flush=True)
+
+    known_qids: set[str] = {qid for qid, _ in found}
     while empty_streak < max_empty:
         hi = lo + QID_STEP
         query = f"""
@@ -185,8 +209,12 @@ SELECT ?item ?n WHERE {{
             raise RuntimeError(
                 f"{type_qid} 的 QID {lo}-{hi} 连续 {retries} 次失败；已拿到 {len(found)} 条"
             )
-        for row in rows:
-            found.append((row["item"].rsplit("/", 1)[-1], int(row["n"])))
+        slice_rows = [(row["item"].rsplit("/", 1)[-1], int(row["n"])) for row in rows]
+        # 内存去重：进程若在「写完数据、还没写 progress」之间被杀，
+        # 下次会重扫该片；这里挡住重复追加，避免缓存再一次翻倍喵
+        fresh_rows = [(qid, sits) for qid, sits in slice_rows if qid not in known_qids]
+        known_qids.update(qid for qid, _ in fresh_rows)
+        found.extend(fresh_rows)
         if rows:
             empty_streak = 0
             print(f"  [QID {lo:,}-{hi:,}] +{len(rows)} 累计 {len(found):,}", flush=True)
@@ -195,12 +223,21 @@ SELECT ?item ?n WHERE {{
             print(f"  [QID {lo:,}-{hi:,}] 空片 {empty_streak}/{max_empty}", flush=True)
         lo += QID_STEP
 
-    if cache is not None:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        with cache.open("w", encoding="utf-8") as fp:
-            for qid, sits in found:
-                fp.write(json.dumps({"qid": qid, "sitelinks": sits}) + "\n")
-        print(f"  ID 缓存已落盘 {len(found):,} 个 -> {cache}", flush=True)
+        # 每片立刻落盘，中断后从 lo 续扫，永不重扫前面的片喵
+        if cache is not None:
+            if fresh_rows:
+                with cache.open("a", encoding="utf-8") as fp:
+                    for qid, sits in fresh_rows:
+                        fp.write(json.dumps({"qid": qid, "sitelinks": sits}) + "\n")
+            progress_path.write_text(
+                json.dumps({"next_lo": lo, "done": False}) + "\n", encoding="utf-8"
+            )
+
+    if progress_path is not None:
+        progress_path.write_text(
+            json.dumps({"next_lo": lo, "done": True}) + "\n", encoding="utf-8"
+        )
+        print(f"  ID 缓存完成 {len(found):,} 个 -> {cache}", flush=True)
     return found
 
 
@@ -220,10 +257,11 @@ def fetch_labels(
         batch = qids[start:start + LABEL_BATCH]
         values = " ".join(f"wd:{qid}" for qid in batch)
         query = f"""
-SELECT ?item ?zh ?en WHERE {{
+SELECT ?item ?zh ?en ?any WHERE {{
   VALUES ?item {{ {values} }}
   OPTIONAL {{ ?item rdfs:label ?zh FILTER(LANG(?zh) = "zh") }}
   OPTIONAL {{ ?item rdfs:label ?en FILTER(LANG(?en) = "en") }}
+  OPTIONAL {{ ?item rdfs:label ?any }}
 }}
 """
         rows = None
@@ -241,9 +279,11 @@ SELECT ?item ?zh ?en WHERE {{
             raise RuntimeError(f"label 批次 {start} 连续 {retries} 次失败")
         for row in rows:
             qid = row["item"].rsplit("/", 1)[-1]
-            name = row.get("zh") or row.get("en") or ""
+            # 中文优先、英文次之、任意语言兜底：有些实体没有中/英文标签，
+            # 只留 zh/en 会让它们永远补不上，那不是重试能解决的喵
+            name = row.get("zh") or row.get("en") or row.get("any") or ""
             name = _to_simplified(name.strip())
-            if name and name != qid:
+            if name and name != qid and qid not in names:
                 names[qid] = name
         if (start // LABEL_BATCH) % 20 == 0:
             print(f"  label 进度 {start + len(batch):,}/{len(qids):,}", flush=True)

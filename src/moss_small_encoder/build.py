@@ -33,7 +33,18 @@ import yaml
 from tqdm import tqdm
 
 from . import clean, labels, synth_layout
-from .sources import SOURCES, danbooru, entities, goku, gustavosta, jtatman, moss_official, n714, shuixian
+from .sources import (
+    SOURCES,
+    danbooru,
+    danbooru_cn,
+    entities,
+    goku,
+    gustavosta,
+    jtatman,
+    moss_official,
+    n714,
+    shuixian,
+)
 from .tokenizer import MAX_TEXT_TOKENS, MossTokenizer
 
 # 源 -> 清洗函数。每个函数只做「这个词源已知的污染」。
@@ -382,12 +393,104 @@ def _iter_official(bucket: dict, cfg: dict) -> Iterator[dict]:
         }
 
 
+def _iter_characters_cn(bucket: dict, cfg: dict) -> Iterator[dict]:
+    """产出「中文译名 + 英文 tag」记录，让中文专名与外观绑定喵。
+
+    Args:
+        bucket: 桶配置（tags_cn / per_character / min_post_count / max_characters）。
+        cfg: 全局配置（用到 seed）。
+
+    Yields:
+        文本已就绪、无需清洗的记录；`lang` 为 `zh` 或 `mix`喵。
+
+    Notes:
+        来源是 ffdkj 的 danbooru tag 中英对照表（MIT）喵。
+        文本里中文名与英文 tag 并列出现，教师在同一序列里看到两种写法，
+        隐状态才会把「中文写法」和「那张图」关联起来喵。
+        这里不写任何外观词：外观由教师提供，我们只负责并列两种写法喵。
+    """
+    for record in danbooru_cn.iter_records(
+        Path(bucket["tags_cn"]),
+        per_character=bucket.get("per_character", 4),
+        seed=cfg["seed"],
+        min_post_count=bucket.get("min_post_count", 0),
+        max_characters=bucket.get("max_characters"),
+    ):
+        yield {
+            "text": record.text,
+            "source": "danbooru_cn",
+            "source_id": record.source_id,
+            "kind": "positive",
+            "nsfw": False,
+            "meta": record.meta,
+            "lang": record.lang,
+        }
+
+
+def _iter_artists(bucket: dict, cfg: dict) -> Iterator[dict]:
+    """产出 danbooru 画师变体（只给画师 tag，不给属性词）喵。
+
+    Args:
+        bucket: 桶配置（tags / per_artist / min_post_count / max_artists）。
+        cfg: 全局配置（用到 seed）。
+
+    Yields:
+        文本已就绪、无需清洗的记录喵。
+    """
+    for record in danbooru.iter_artists(
+        Path(bucket["tags"]),
+        per_artist=bucket.get("per_artist", 1),
+        seed=cfg["seed"],
+        max_artists=bucket.get("max_artists"),
+        min_post_count=bucket.get("min_post_count", 0),
+    ):
+        yield {
+            "text": record.text,
+            "source": "danbooru",
+            "source_id": record.source_id,
+            "kind": "positive",
+            "nsfw": False,
+            "meta": record.meta,
+            "lang": "en",
+        }
+
+
+def _iter_tag_seq(bucket: dict, cfg: dict) -> Iterator[dict]:
+    """产出按官方推荐顺序拼好的真实 tag 序列喵。
+
+    Args:
+        bucket: 桶配置（tags / min_post_count）。
+        cfg: 全局配置（用到 seed）。
+
+    Yields:
+        文本已就绪的记录喵。
+    """
+    for record in danbooru.iter_tag_sequences(
+        Path(bucket["tags"]),
+        bucket["quota"],
+        seed=cfg["seed"],
+        min_post_count=bucket.get("min_post_count", 50),
+    ):
+        yield {
+            "text": record.text,
+            "source": "danbooru",
+            "source_id": record.source_id,
+            "kind": "positive",
+            "nsfw": False,
+            "meta": record.meta,
+            "lang": "en",
+        }
+
+
 ITERATORS: dict[str, Callable[[dict, dict], Iterator[dict]]] = {
     "stream": _iter_stream,
     "synth": _iter_synth,
     "tag_compose": _iter_tags,
     "enumerate": _iter_entities,
     "characters": _iter_characters,
+    "characters_cn": _iter_characters_cn,
+    "artists": _iter_artists,
+    "tag_seq": _iter_tag_seq,
     "official": _iter_official,
 }
 
@@ -453,7 +556,9 @@ def collect_bucket(
 
     rows = []
     for item in kept:
-        # 桶自己给了唯一 id 就用它：layout / entity 这类一个源 id 会展开成多条记录，`n        # 用 source_id 拼 id 会撞车（历史上 layout 就撞出 3000 行同 id）喵。`n        record_id = item.get("record_id") or f"{bucket['name']}:{item['source']}:{item['source_id']}"
+        # 桶自己给了唯一 id 就用它：layout / entity 这类一个源 id 会展开成多条记录，
+        # 用 source_id 拼 id 会撞车（历史上 layout 就撞出 3000 行同 id）喵。
+        record_id = item.get("record_id") or f"{bucket['name']}:{item['source']}:{item['source_id']}"
         text = item["text"]
         lang = item.get("lang") or clean.detect_lang(text)
         nsfw = item["nsfw"]

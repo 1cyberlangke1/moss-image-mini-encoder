@@ -1,0 +1,65 @@
+# 纯知识桶构建配置（不联网）。
+#
+# 只收五个本地桶：wikidata 实体、danbooru 英中角色、danbooru 画师、tag 序列。
+# 上游文件全部已经在 dataset/ 下，构建过程不发任何网络请求喵。
+#
+# 为什么和 dataset_v2.yaml 分开：v2 里的 jtatman / gustavosta / shuixian / goku
+# 四个桶要读 HF parquet，代理一抖就整轮失败。那部分语料已经洗完落在
+# dataset/prompts.jsonl（38,496 条），当回放用，不需要重新拉喵。
+#
+# 配额一律给满：这五个桶的目标是「每个专名至少出现一次」，
+# 任何配额不足都会静默少掉一批专名，所以让供给量自己决定条数喵。
+
+seed: 20261027
+
+max_tokens: 4096
+min_chars: 2
+max_chars: 20000
+
+cache_dir: tmp/raw
+out_dir: dataset/kb
+
+splits:
+  train: 0.70
+  val: 0.15
+  test: 0.15
+
+buckets:
+  # Wikidata 实体，只给名字，不给外观词；属性由教师看到名字后产生喵。
+  - name: entity
+    kind: enumerate
+    entities: dataset/wikidata/entities.jsonl
+    per_entity: 1
+    min_sitelinks: 1
+    quota: 2000000
+
+  # 英文角色名，只给名字喵。
+  - name: characters
+    kind: characters
+    tags: dataset/danbooru_api/tags.jsonl
+    per_character: 1
+    min_post_count: 10
+    quota: 2000000
+
+  # 中文译名（带作品名），只给名字喵。
+  - name: characters_cn
+    kind: characters_cn
+    tags_cn: dataset/danbooru_cn/tags.csv
+    per_character: 1
+    min_post_count: 10
+    quota: 2000000
+
+  # 画师，`@名字` 前缀，主体固定为 1girl/1boy/scenery喵。
+  - name: artists
+    kind: artists
+    tags: dataset/danbooru_api/tags.jsonl
+    per_artist: 1
+    min_post_count: 10
+    quota: 2000000
+
+  # 真实 tag 序列，按官方推荐顺序拼，不含角色（避免假属性绑定）喵。
+  - name: tag_seq
+    kind: tag_seq
+    tags: dataset/danbooru_api/tags.jsonl
+    min_post_count: 50
+    quota: 30000
