@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from moss_small_encoder.packing import packed_forward_kwargs, packing_metadata
-from moss_small_encoder.train.finetune import build_packed_batches, make_packed_batch
+from moss_small_encoder.train.finetune import PAD_ID, build_packed_batches, make_packed_batch
 
 
 class _FakeTokenizer:
@@ -104,6 +104,46 @@ def test_make_packed_batch_offsets_and_teacher_trim() -> None:
     assert flat_ids.tolist() == [[1, 2, 3, 4, 5]]
     assert cu_seqlens.tolist() == [0, 3, 5]
     assert [t.shape[0] for t in kept] == [3, 2]
+
+
+def test_make_packed_batch_pads_to_fixed_length() -> None:
+    """补齐到固定总长时，末尾追加一个只含 padding 的假段喵。
+
+    输入: 两条长度 4 与 3 的样本，`pad_to=10`（真实 5 个 token）
+    输出: flat 长度 10，cu_seqlens 末尾多一段，teacher 仍是 5 行
+    预期: 假段让每一步的激活形状一致，且不进入损失喵
+    """
+    tokenizer = _FakeTokenizer({"a": [100, 1, 2, 3], "b": [200, 4, 5]})
+    teachers = [
+        np.zeros((4, 2), dtype=np.float16),
+        np.zeros((3, 2), dtype=np.float16),
+    ]
+    flat_ids, cu_seqlens, kept = make_packed_batch(
+        tokenizer, ["a", "b"], teachers, pad_to=10
+    )
+    assert flat_ids.shape == (1, 10)
+    assert cu_seqlens.tolist() == [0, 3, 5, 10]
+    assert flat_ids[0, 5:].tolist() == [PAD_ID] * 5
+    assert sum(int(t.shape[0]) for t in kept) == 5
+
+
+def test_make_packed_batch_ignores_smaller_pad_to() -> None:
+    """`pad_to` 小于真实长度时不做任何裁剪喵。
+
+    输入: 真实 5 个 token，`pad_to=3`
+    输出: 长度仍是 5，cu_seqlens 仍是 [0, 3, 5]
+    预期: 补齐只增不减，绝不静默丢掉真实 token喵
+    """
+    tokenizer = _FakeTokenizer({"a": [100, 1, 2, 3], "b": [200, 4, 5]})
+    teachers = [
+        np.zeros((4, 2), dtype=np.float16),
+        np.zeros((3, 2), dtype=np.float16),
+    ]
+    flat_ids, cu_seqlens, _ = make_packed_batch(
+        tokenizer, ["a", "b"], teachers, pad_to=3
+    )
+    assert flat_ids.shape == (1, 5)
+    assert cu_seqlens.tolist() == [0, 3, 5]
 
 
 def test_make_packed_batch_rejects_mismatched_tokens() -> None:

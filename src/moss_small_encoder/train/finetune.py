@@ -333,16 +333,21 @@ def make_packed_batch(
     texts: list[str],
     teachers: list[np.ndarray],
     id_seqs: list[np.ndarray] | None = None,
+    pad_to: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
-    """把若干条 prompt 首尾相接成一个批，不做补齐喵。
+    """把若干条 prompt 首尾相接成一个批，可选把总长补齐到固定值喵。
 
-    输入: 分词器、文本列表、对应教师特征、可选的预分词 id 列表
-    输出: `(input_ids[1,total], cu_seqlens[N+1], teacher 列表)`
-    预期: 两边都切掉 token 0，拼接顺序与输入一致喵
+    输入: 分词器、文本列表、对应教师特征、可选的预分词 id 列表、
+        固定总长 `pad_to`（0 表示不补）
+    输出: `(input_ids[1,total], cu_seqlens[N+1 或 N+2], teacher 列表)`
+    预期: 两边都切掉 token 0，拼接顺序与输入一致；`pad_to` 大于真实长度时
+        末尾追加一个只含 padding 的假段，返回的 `teacher` 不含这一段喵
 
     Notes:
-        没有 pad 位置，所以损失侧也不需要再用 mask 过滤；
-        教师特征按同样的顺序切掉 token 0 后直接 cat 起来就是逐 token 对齐喵。
+        补齐是为了让每一步的激活张量形状完全一致。变长打包下每步总长与段数都在变，
+        显存分配器只能反复找新块，保留量会一点点抬高，抬到物理上限就溢出到共享显存，
+        表现为训练前期很快、某一步之后突然变慢喵。
+        假段放在最末尾，训练侧按真实 token 数切掉前缀即可，不参与任何损失喵。
     """
     all_ids = tokenizer.encode_batch(texts) if id_seqs is None else id_seqs
     flat: list[int] = []
@@ -359,6 +364,9 @@ def make_packed_batch(
         kept.append(torch.from_numpy(teacher[1:]))
     if not kept:
         raise RuntimeError("没有一条样本的 token 数与特征对齐喵")
+    if pad_to > len(flat):
+        flat.extend([PAD_ID] * (pad_to - len(flat)))
+        bounds.append(len(flat))
     input_ids = torch.tensor(flat, dtype=torch.long).unsqueeze(0)
     cu_seqlens = torch.tensor(bounds, dtype=torch.int32)
     return input_ids, cu_seqlens, kept
@@ -566,10 +574,12 @@ class _BatchPrefetcher:
         batches,
         depth: int = 2,
         packed: bool = False,
+        pad_to: int = 0,
     ) -> None:
         self._queue: queue.Queue = queue.Queue(maxsize=depth)
         self._stop = threading.Event()
         self._packed = packed
+        self._pad_to = pad_to
         self._thread = threading.Thread(
             target=self._produce,
             args=(reader, tokenizer, texts, id_cache, batches),
@@ -596,7 +606,8 @@ class _BatchPrefetcher:
             try:
                 if self._packed:
                     prepared = make_packed_batch(
-                        tokenizer, [texts[i] for i in batch], teachers, id_seqs
+                        tokenizer, [texts[i] for i in batch], teachers, id_seqs,
+                        pad_to=self._pad_to,
                     )
                 else:
                     prepared = make_batch(
@@ -686,7 +697,8 @@ def train_finetune(
             else build_length_batches(train_idx, reader.lengths, config.batch_tokens, rng)
         )
         prefetcher = _BatchPrefetcher(
-            reader, tokenizer, texts, id_cache, batches, packed=config.packed
+            reader, tokenizer, texts, id_cache, batches, packed=config.packed,
+            pad_to=config.batch_tokens if config.packed else 0,
         ).start()
         for _batch, prepared in prefetcher:
             if step >= config.steps:
@@ -712,7 +724,9 @@ def train_finetune(
                         decoder_layers(peft_model), config.taps, run_forward
                     )
                     hidden_full = torch.cat(taps_out, dim=-1).float()
-                hidden = hidden_full.reshape(-1, hidden_full.shape[-1])
+                # 末尾那段是补齐用的假段，按真实 token 数切掉，不进损失喵
+                real_tokens = sum(int(item.shape[0]) for item in kept)
+                hidden = hidden_full.reshape(-1, hidden_full.shape[-1])[:real_tokens]
                 teacher_flat = torch.cat([item.to(device) for item in kept], dim=0)
             else:
                 input_ids, mask, kept = prepared
@@ -751,7 +765,10 @@ def train_finetune(
                 result.history.append(record)
                 print(f"step {step:>5} loss {parts['loss']:.6f} cka {parts['cka']:.6f} "
                       f"col {parts['collapse']:.4f} "
-                      f"{time.time() - started:.1f}s", flush=True)
+                      f"{time.time() - started:.1f}s "
+                      f"alloc {torch.cuda.memory_allocated() / 2**30:.2f} "
+                      f"resv {torch.cuda.memory_reserved() / 2**30:.2f} "
+                      f"free {torch.cuda.mem_get_info()[0] / 2**30:.2f}", flush=True)
 
             if config.eval_every and step % config.eval_every == 0:
                 cka = evaluate_cka(peft_model, tokenizer, reader, texts, val_idx,
