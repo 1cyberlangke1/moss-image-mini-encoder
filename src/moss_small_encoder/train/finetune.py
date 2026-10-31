@@ -563,9 +563,9 @@ def build_tier_batches(
         else:
             slots[tiers.index(t)].append(idx)
 
-    # 档位之间打乱，避免相邻步的形状与长度单调
+    # 档位之间打乱，避免相邻步的形状与长度单调；空档位剔除喵
     order = rng.permutation(len(slots))
-    return [slots[i] for i in order]
+    return [slots[i] for i in order if slots[i]]
 
 
 def _cka_fp32(student: torch.Tensor, teacher: torch.Tensor, eps: float = 1e-8) -> float:
@@ -1095,23 +1095,6 @@ def main(argv: list[str] | None = None) -> int:
         train_idx = train_idx[: args.samples]
         val_idx = val_idx[: max(8, args.samples // 4)]
 
-    train_tokens = sum(lengths[i] for i in train_idx)
-    # 步数按真实批数算：短句多的一轮批数远多于「token/预算」，不能拿理论值估喵
-    if args.packed:
-        plan = build_packed_batches(
-            train_idx, lengths, args.batch_tokens, np.random.default_rng(0)
-        )
-    else:
-        plan_tiers = tiers or tuple(default_pad_tiers(args.batch_tokens))
-        plan = build_tier_batches(
-            train_idx, lengths, args.batch_tokens, np.random.default_rng(0),
-            list(plan_tiers),
-        )
-    steps = args.steps or max(1, len(plan) * max(1, args.epochs))
-    print(f"训练 {len(train_idx)} 条 / {train_tokens:,} token；"
-          f"验证 {len(val_idx)} 条 / {used:,} token；"
-          f"每轮 {len(plan)} 批，共 {steps} 步 x {args.batch_tokens} token", flush=True)
-
     tiers: tuple[int, ...] | None = None
     if not args.packed:
         if args.pad_tiers:
@@ -1122,6 +1105,22 @@ def main(argv: list[str] | None = None) -> int:
         else:
             tiers = tuple(default_pad_tiers(args.batch_tokens))
         print(f"档位 {list(tiers)}", flush=True)
+
+    train_tokens = sum(lengths[i] for i in train_idx)
+    # 步数按真实批数算：短句多的一轮批数远多于「token/预算」，不能拿理论值估喵
+    if args.packed:
+        plan = build_packed_batches(
+            train_idx, lengths, args.batch_tokens, np.random.default_rng(0)
+        )
+    else:
+        plan = build_tier_batches(
+            train_idx, lengths, args.batch_tokens, np.random.default_rng(0),
+            list(tiers),
+        )
+    steps = args.steps or max(1, len(plan) * max(1, args.epochs))
+    print(f"训练 {len(train_idx)} 条 / {train_tokens:,} token；"
+          f"验证 {len(val_idx)} 条 / {used:,} token；"
+          f"每轮 {len(plan)} 批，共 {steps} 步 x {args.batch_tokens} token", flush=True)
 
     reader = PromptFeatureReader(features, lengths, starts, d_out)
     enc = StudentEncoder(
