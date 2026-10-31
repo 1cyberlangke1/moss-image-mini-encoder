@@ -277,3 +277,18 @@ def test_save_checkpoint_keep_last_rotates(tmp_path) -> None:
     loras = sorted(p.name for p in tmp_path.glob("lora_step_*"))
     assert ckpts == ["checkpoint_step_000200.pt", "checkpoint_step_000300.pt"]
     assert len(loras) == 3
+
+
+def test_find_latest_checkpoint(tmp_path) -> None:
+    """find_latest_checkpoint 要返回步数最大的那份喵。
+
+    输入: 三个乱序写入的断点文件
+    输出: `find_latest_checkpoint` 的返回值
+    预期: 返回 300 那份；空目录返回 None 喵
+    """
+    from moss_small_encoder.train.finetune import find_latest_checkpoint
+
+    for step in (100, 300, 200):
+        (tmp_path / f"checkpoint_step_{step:06d}.pt").write_bytes(b"x")
+    assert find_latest_checkpoint(tmp_path).name == "checkpoint_step_000300.pt"
+    assert find_latest_checkpoint(tmp_path / "nonexist") is None

@@ -736,6 +736,17 @@ class _BatchPrefetcher:
         self._thread.join(timeout=5.0)
 
 
+def find_latest_checkpoint(out_dir: Path) -> Path | None:
+    """找输出目录里步数最大的完整断点喵。
+
+    输入: 输出目录
+    输出: 最新 `checkpoint_step_*.pt` 的路径；没有则 None
+    预期: 轮转删旧后剩下的就是最新那份，`--resume` 不带值时用它喵
+    """
+    ckpts = sorted(out_dir.glob("checkpoint_step_*.pt"))
+    return ckpts[-1] if ckpts else None
+
+
 def train_finetune(
     model,
     tokenizer,
@@ -747,15 +758,20 @@ def train_finetune(
     out_dir: Path,
     device: str | torch.device = "cuda",
     id_cache: "IdCache | None" = None,
+    resume: Path | None = None,
 ) -> FinetuneResult:
     """跑流式微调循环喵。
 
-    输入: 主干、分词器、特征读取器、全部文本、训练/验证下标、配置、输出目录
+    输入: 主干、分词器、特征读取器、全部文本、训练/验证下标、配置、输出目录、
+        断点路径（None 表示从头训）
     输出: `FinetuneResult`；LoRA 写到 `out_dir/lora`
     预期: 每步现读一小批教师特征，显存与内存都不随语料规模增长喵
 
     Notes:
         只训 LoRA，优化器只有一组参数；线性头留给训练之后单独解喵。
+        `resume` 给出时恢复 step/优化器/调度器，LoRA 权重从
+        `lora_step_XXXXXX/` 同名目录加载；断点里的步数之前的批被跳过，
+        批次顺序由固定种子保证与首跑一致喵。
     """
     device = torch.device(device)
     torch.manual_seed(config.seed)
@@ -770,13 +786,29 @@ def train_finetune(
         opt, T_max=config.steps, eta_min=config.lr_lora * config.min_lr_ratio
     )
 
+    start_step = 0
+    if resume is not None:
+        payload = torch.load(resume, map_location="cpu", weights_only=False)
+        start_step = int(payload["step"])
+        lora_dir = resume.parent / f"lora_step_{start_step:06d}"
+        # peft 存的键带 base_model.model. 前缀，须用 PeftModel.from_pretrained 装喵
+        from peft import PeftModel
+
+        peft_model = PeftModel.from_pretrained(
+            model, str(lora_dir), is_trainable=True
+        )
+        peft_model.to(device)
+        opt.load_state_dict(payload["optimizer"])
+        sched.load_state_dict(payload["scheduler"])
+        print(f"从 {resume.name} 恢复到第 {start_step} 步（LoRA 来自 {lora_dir.name}）", flush=True)
+
     out_dir.mkdir(parents=True, exist_ok=True)
     result = FinetuneResult(steps=0)
     peft_model.train()
     started = time.time()
-    last_log_t, last_log_step = started, 0
+    last_log_t, last_log_step = started, start_step
     best = -1.0
-    step = 0
+    step = start_step
     skipped = 0
 
     while step < config.steps:
@@ -810,6 +842,10 @@ def train_finetune(
             if step >= config.steps:
                 prefetcher.stop()
                 break
+            if step < start_step:
+                # resume：首轮里已完成步对应的批直接跳过，不读特征不算损失喵
+                step += 1
+                continue
             if prepared is None:
                 skipped += 1
                 continue
@@ -1068,6 +1104,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--keep-last", type=int, default=0,
                         help="断点轮转：只保留最近 N 份 checkpoint_step_*.pt；"
                              "0 表示全保留。LoRA 目录不受影响，全保留喵")
+    parser.add_argument("--resume", nargs="?", const="latest", default=None,
+                        help="从断点恢复：给 checkpoint 路径，或不带值自动找最新喵")
     parser.add_argument("--merge", action="store_true",
                         help="把 LoRA 合并进主干并写到 --out/merged 喵")
     parser.add_argument("--lora", default="lora",
@@ -1197,9 +1235,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"自检{'通过' if ok else '失败'}  cka 差 {d_cka:.2e}", flush=True)
         reader.close()
         return 0 if ok else 1
+    resume_path: Path | None = None
+    if args.resume:
+        if args.resume == "latest":
+            resume_path = find_latest_checkpoint(args.out)
+            if resume_path is None:
+                print(f"{args.out} 下没有断点，从头训喵", flush=True)
+        else:
+            resume_path = Path(args.resume)
+            assert resume_path.is_file(), f"断点不存在: {resume_path}"
     result = train_finetune(
         enc.model, tokenizer, reader, texts, train_idx, val_idx,
-        config, args.out, args.device, id_cache
+        config, args.out, args.device, id_cache, resume_path
     )
     reader.close()
 
