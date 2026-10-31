@@ -69,10 +69,18 @@ build-*/
 /models/*
 !/models/README.md
 
-# dataset/ 下只有 3 份文档入库，语料与 features/ 全部忽略。
+# dataset/ 下只有文档、以及 LLM 合成的硬 case 语料入库；
+# 其余语料与 features/ 全部忽略（可由 sources/ 与 build 重新拉取）。
+# 注意：/dataset/* 会连子目录一起忽略，白名单必须逐级写出来喵。
 /dataset/*
 !/dataset/stats.md
 !/dataset/manifest.json
+!/dataset/hard_cases/
+/dataset/hard_cases/*
+!/dataset/hard_cases/v1/
+/dataset/hard_cases/v1/*
+!/dataset/hard_cases/v1/prompts.jsonl
+!/dataset/hard_cases/v1/manifest.json
 
 # 训练产出的适配器与检查点都是可复现的中间产物，不入库。
 /output/*

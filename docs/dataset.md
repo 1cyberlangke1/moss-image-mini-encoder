@@ -29,6 +29,13 @@ python -m moss_small_encoder.build --config src/configs/dataset_v1.yaml
 | `n714` | 4,000 | MIT | https://github.com/n714/stable-diffusion-prompt-library-zh_CN |
 | `shuixian` | 4,000 | Attribution Required License v1.0 | https://github.com/BaYue-SYJ/shuixian-prompts |
 | `synth_layout` | 3,000 | 本仓库自生成 | 遵循 MOSS-Image 布局规范合成 |
+| `hard_cases` | 3,840 | 本仓库自生成（LLM 合成） | 由 DeepSeek、Gemini 按固定任务书生成，随仓库分发 |
+
+### 硬 case 语料的来源
+
+`dataset/hard_cases/v1/prompts.jsonl` 由第三方大模型按固定任务书生成：12 个类别（主视觉、封面、海报、菜单、招牌、包装、UI、漫画、长文、群像、户外、信息图）乘 8 种风格，每格 40 条，全中文，`nsfw` 全为 `False`。
+
+数据里只保留模型输出的提示词文本，不含上游模型的权重、服务凭证或对话记录。分发时按本仓库许可提供，使用者仍需自行确认其所用模型服务的条款是否允许此类再分发喵。
 
 ### 署名声明
 
