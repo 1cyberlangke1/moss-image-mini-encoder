@@ -73,6 +73,30 @@ cond = z @ W * std_out + mean_out
 
 特征与中间状态序列化为二进制文件，并通过记录 Token 偏移量支持断点续跑，防止中断后重复计算。
 
+### 变长打包（`--packed`）
+
+教师遍默认把一批补齐成矩形，批内长度离散度大时，算力有相当一部分烧在 pad 上。
+`--packed` 改成把整批首尾相接成一条序列，用 flash-attn 的 varlen 接口一次前向：
+
+- 完整注意力层靠 `cu_seqlens` 分段，线性注意力的 gated delta rule 靠 fla 的
+  `cu_seqlens` 重置递推，卷积层靠 `seq_idx` 在段边界断开；
+- `position_ids` 与 `seq_idx` 都由 `cu_seqlens` 反推，不单独传参，避免两处不一致；
+- 不补 pad，长度离散度那条关批条件失效，预算按真实 token 填满。
+
+依赖三项缺一不可：`flash-attn`、`flash-linear-attention`、`causal-conv1d`。
+缺任一项直接报错而不降级：`sdpa` 会忽略 `cu_seqlens`，PyTorch 版 delta rule
+不认 `cu_seqlens`，`F.conv1d` 不看 `seq_idx`，三种退化都是静默跨段串味，
+结果看起来正常但数值全错。
+
+等价性用极小随机初始化模型对拍验证（长度 1/2/3/50/120）：packed 对逐条单独前向的
+余弦分别为 1.00000000 / 0.99999815 / 0.99999440 / 0.99999386 / 0.99999410，
+最大绝对差不超过 0.03125（bf16 舍入步长量级）；换掉首条内容后，其余各条输出逐位相同。
+
+续跑时若已有 `teacher.raw`，程序先拿它当基准对拍前 20 条（跳过 token 0 这个
+attention sink），余弦均值低于 0.9990 或单条低于 0.9950 立即退出，此时写入器尚未打开。
+写入器本身也拒绝在缺少续跑记录时覆盖非空文件，直接抛 `FileExistsError`，
+不会回落到 `wb` 把已有特征清零。
+
 ---
 
 ## 投影层求解
