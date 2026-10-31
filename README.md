@@ -102,7 +102,7 @@ New-Item -ItemType Junction `
 |---|---|
 | 0.8B bf16 | [Qwen/Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B) |
 | 2B bf16 | [Qwen/Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) |
-| 4B bf16 | [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) |
+| 4B 官方原版权重（bf16） | [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B)；本仓库仅为 4B 训练 w4a8 适配器，不提供 bf16 适配器 |
 | 9B 教师（仅重训 / 对照） | [Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B)，或 ComfyUI 可直接用的 [w4a8 量化版](https://huggingface.co/Comfy-Org/MOSS-Image/resolve/main/text_encoders/qwen3.5_9b_w4a8_gptq.safetensors) |
 
 ### 3. 工作流节点连接
@@ -116,7 +116,7 @@ MossCLIPLoader(clip_name, type="moss_image", adapter)
 
 - `MossCLIPLoader` 仅比原生节点多出 `adapter` 选项，输出的 CLIP 接口完全兼容官方标准。
 - 当 `adapter` 选为 `none` 时，不启用投影，行为与官方原生加载一致。
-- 详细节点参数与说明可参考 [`docs/comfyui-node`](docs/comfyui-node.md)。
+- 详细节点参数与说明可参考 [`docs/comfyui-node.md`](docs/comfyui-node.md)。
 
 ---
 

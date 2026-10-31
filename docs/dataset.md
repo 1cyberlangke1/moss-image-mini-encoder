@@ -14,11 +14,14 @@ python src/scripts/download_models.py
 pip install -e .
 # export PYTHONPATH=src    # PowerShell: $env:PYTHONPATH="src"
 
-# 执行语料清洗、分词与分桶构建
+# 执行语料清洗、分词与分桶构建（产出 38,496 条 / 6,374,951 token，不含 hard_cases）
 python -m moss_small_encoder.build --config src/configs/dataset_v1.yaml
+
+# 合并知识桶、hard_cases 与构建产物
+python -m moss_small_encoder.merge --out dataset/corpus
 ```
 
-外部数据源均锁定固定 Commit SHA，配合固定随机种子确保构建过程可严格复现。
+外部数据源均锁定固定 Commit SHA；抽样按 `source_id` 哈希、划分按记录 id 哈希确定性计算，同一份输入重跑结果逐字节一致。
 
 ---
 
@@ -34,6 +37,8 @@ python -m moss_small_encoder.build --config src/configs/dataset_v1.yaml
 | `shuixian` | 4,000 | Attribution Required License v1.0 | https://github.com/BaYue-SYJ/shuixian-prompts |
 | `synth_layout` | 3,000 | 本仓库自生成 | 遵循 MOSS-Image 布局规范合成 |
 | `hard_cases` | 3,840 | 本仓库自生成（LLM 合成） | 由 DeepSeek、Gemini 按固定任务书生成，随仓库分发 |
+
+前七项合计 38,496 条 / 6,374,951 token，即 `build` 的产物；`hard_cases` 的 3,840 条不在其中，由 `merge.py` 的 `SOURCES`（`kb` / `hard_cases` / `replay`）在合并阶段并入。
 
 ### 硬 case 语料的来源
 
@@ -52,4 +57,4 @@ python -m moss_small_encoder.build --config src/configs/dataset_v1.yaml
 - **长度约束**：超过 4096 Token 的样本整条剔除，避免截断产生断句破坏语义；
 - **语种与翻译**：`goku` 包含部分机器翻译中文内容，用于扩充多语言词汇覆盖；
 - **布局格式**：`synth_layout` 由模板生成，用于覆盖 MOSS-Image 的排版与坐标语法；
-- **分层抽样**：采用原生标签与关键词规则结合进行抽样与数据平衡。
+- **确定性抽样**：每个桶按 `source_id` 哈希优先级取前 N 条，配额变化时已选样本保持不变；不按标签分层。
