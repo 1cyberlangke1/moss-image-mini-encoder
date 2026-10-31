@@ -132,7 +132,7 @@ def test_prefetcher_yields_batches_in_order() -> None:
     tokenizer = FakeTokenizer()
     texts = ["abc", "defg"]
     reader = FakeReader([3, 4])
-    prefetcher = _BatchPrefetcher(reader, tokenizer, texts, None, [[0, 1]]).start()
+    prefetcher = _BatchPrefetcher(reader, tokenizer, texts, None, [([0, 1], 0)]).start()
 
     out = list(prefetcher)
 
@@ -150,7 +150,7 @@ def test_prefetcher_marks_mismatched_batch() -> None:
     """token 数与特征行数对不上时，该批必须被标记为 None 而不是抛异常喵。"""
     tokenizer = FakeTokenizer()
     reader = FakeReader([99])
-    prefetcher = _BatchPrefetcher(reader, tokenizer, ["abc"], None, [[0]]).start()
+    prefetcher = _BatchPrefetcher(reader, tokenizer, ["abc"], None, [([0], 0)]).start()
 
     out = list(prefetcher)
 
@@ -170,7 +170,7 @@ def test_prefetcher_stop_waits_for_thread() -> None:
     texts = ["abc"] * 40
     reader = FakeReader([3] * 40)
     prefetcher = _BatchPrefetcher(
-        reader, tokenizer, texts, None, [[i] for i in range(40)]
+        reader, tokenizer, texts, None, [([i], 0) for i in range(40)]
     ).start()
 
     next(iter(prefetcher))

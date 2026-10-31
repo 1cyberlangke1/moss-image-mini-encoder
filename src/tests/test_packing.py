@@ -14,7 +14,15 @@ import pytest
 import torch
 
 from moss_small_encoder.packing import packed_forward_kwargs, packing_metadata
-from moss_small_encoder.train.finetune import PAD_ID, build_length_batches, build_packed_batches, make_packed_batch
+from moss_small_encoder.train.finetune import (
+    PAD_ID,
+    build_length_batches,
+    build_packed_batches,
+    build_tier_batches,
+    default_pad_tiers,
+    make_batch,
+    make_packed_batch,
+)
 
 
 class _FakeTokenizer:
@@ -127,6 +135,72 @@ def test_length_batches_respect_aspect_and_budget() -> None:
         assert len(batch) * hi <= 2048
 
     assert sorted(x for batch in batches for x in batch) == indices
+
+
+def test_default_pad_tiers_geometric() -> None:
+    """默认档位要升序、盖住预算、相邻比值约 1.5 喵。
+
+    输入: 预算 2048
+    输出: `default_pad_tiers` 的档位表
+    预期: 首档 16、末档等于预算、严格升序
+    """
+    tiers = default_pad_tiers(2048)
+    assert tiers[0] == 16
+    assert tiers[-1] == 2048
+    assert all(a < b for a, b in zip(tiers, tiers[1:]))
+
+
+def test_tier_batches_fixed_shapes_and_coverage() -> None:
+    """档位切批要给出少数几种固定形状喵。
+
+    输入: 长度从 1 到 900 混排的下标、档位 [32,128,512,1024]、预算 2048
+    输出: `build_tier_batches` 的批次
+    预期: 每批内所有样本都能进同一个档位；批形状（条数 x 档长）种类
+          不超过档位数加超长独占批；所有下标恰好出现一次喵
+    """
+    lengths = [1, 2, 3, 8, 20, 21, 60, 200, 900] * 6
+    indices = list(range(len(lengths)))
+    tiers = [32, 128, 512, 1024]
+    batches = build_tier_batches(
+        indices, lengths, 2048, np.random.default_rng(0), tiers
+    )
+
+    shapes: set[tuple[int, int]] = set()
+    for batch in batches:
+        longest = max(lengths[i] for i in batch)
+        if longest > tiers[-1]:
+            assert len(batch) == 1
+            shapes.add((1, longest))
+            continue
+        tier = min(t for t in tiers if t >= longest)
+        assert len(batch) * tier <= 2048
+        assert len(batch) <= 256
+        shapes.add((len(batch), tier))
+
+    assert len(shapes) <= len(tiers) + 2
+    assert sorted(x for batch in batches for x in batch) == indices
+
+
+def test_make_batch_pads_to_tier() -> None:
+    """make_batch 给 pad_to 时要把 T 固定到档位喵。
+
+    输入: 两条短文本、教师特征与 id 对齐、pad_to=128
+    输出: `make_batch` 的批
+    预期: T 恒为 128，mask 只盖有效位置，超出批内最长的部分是 PAD_ID 喵
+    """
+
+    class _Tok:
+        @staticmethod
+        def encode_batch(texts):
+            return [[5, 6, 7], [8, 9]]
+
+    teachers = [np.zeros((3, 4), dtype=np.float16), np.zeros((2, 4), dtype=np.float16)]
+    input_ids, mask, kept = make_batch(_Tok(), ["a", "b"], teachers, pad_to=128)
+    assert input_ids.shape == (2, 128)
+    assert mask.shape == (2, 128)
+    assert int(mask.sum()) == 3  # 第一条 2 个有效 + 第二条 1 个有效（去掉 token 0）
+    assert int(input_ids[0, 3]) == PAD_ID
+    assert len(kept) == 2
 
 
 def test_make_packed_batch_pads_to_fixed_length() -> None:

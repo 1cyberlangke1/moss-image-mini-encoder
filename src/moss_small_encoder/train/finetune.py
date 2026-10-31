@@ -79,6 +79,7 @@ class FinetuneConfig:
     steps: int = 200
     batch_tokens: int = 4096
     packed: bool = False
+    pad_tiers: tuple[int, ...] | None = None
     eval_every: int = 0
     cka_weight: float = 1.0
     cka_bf16: bool = True
@@ -256,10 +257,12 @@ def make_batch(
     texts: list[str],
     teachers: list[np.ndarray],
     id_seqs: list[np.ndarray] | None = None,
+    pad_to: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
     """把若干条 prompt 打成右 padding 的一个批喵。
 
-    输入: 分词器、文本列表、对应的教师特征、可选的预分词 id 列表
+    输入: 分词器、文本列表、对应的教师特征、可选的预分词 id 列表、
+        固定档位长度（0 表示用批内最长）
     输出: `(input_ids[B,T], attention_mask[B,T], teacher 列表)`
     预期: 两边都切掉 token 0（attention sink），保持逐行对齐喵
 
@@ -267,6 +270,8 @@ def make_batch(
         raw 里保留了 token 0，训练端由读取层跳过；这里同样剔除，
         否则 sink 那个范数上万的行会把 CKA 与余弦都带偏喵。
         `id_seqs` 给出时直接用它，不再调用分词器喵。
+        `pad_to` 大于批内最长时把 T 固定到档位：档位切批要求同一档
+        的批形状恒为 `B_tier x T_tier`，张量尺寸种类才降得下来喵。
     """
     if id_seqs is None:
         # 逐条调 encode 时固定开销占主导，批量接口实测快 4.17 倍喵
@@ -286,6 +291,8 @@ def make_batch(
         raise RuntimeError("没有一条样本的 token 数与特征对齐喵")
 
     max_len = max(int(s.shape[0]) for s in seqs)
+    if pad_to > max_len:
+        max_len = pad_to
     input_ids = torch.full((len(seqs), max_len), PAD_ID, dtype=torch.long)
     mask = torch.zeros((len(seqs), max_len), dtype=torch.long)
     for i, seq in enumerate(seqs):
@@ -497,6 +504,70 @@ def build_length_batches(
 
 
 @torch.no_grad()
+def default_pad_tiers(batch_tokens: int) -> list[int]:
+    """按 token 预算生成几何递增的默认档位喵。
+
+    输入: 单步 token 预算
+    输出: 档位长度列表（升序），相邻档位比值约 1.5，短段密、长段疏
+    预期: 每档「条数 x 档长」恰为预算的倍数关系之内，单条最长样本
+          独占一批时档长也盖得住喵
+
+    Notes:
+        几何递增让量化浪费有界：一条样本向上取整到最近档位，
+        最多浪费约 1/1.5 ≈ 33% 的位置喵。
+    """
+    tiers = [16]
+    while tiers[-1] < batch_tokens:
+        nxt = min(batch_tokens, max(tiers[-1] + 1, int(tiers[-1] * 1.5)))
+        tiers.append(nxt)
+    return tiers
+
+
+def build_tier_batches(
+    indices: list[int],
+    lengths: list[int],
+    budget: int,
+    rng: np.random.Generator,
+    tiers: list[int],
+    max_prompts: int = 256,
+) -> list[list[int]]:
+    """把 prompt 下标按**固定档位**切成批，批形状只有少数几种喵。
+
+    输入: 候选下标、每条 token 数、单批 token 预算、随机数发生器、
+        档位长度列表（升序）、单批条数上限
+    输出: 批次列表；同一档位的批，形状恒为 `B_tier x T_tier`，
+        `B_tier = max(1, budget // T_tier)`
+    预期: 全训练的张量尺寸种类 <= 档位数，PyTorch 缓存池不再随步数增长喵
+
+    Notes:
+        病根是「批形状种类数 x 反向大池子」：变长批 500 步能造出几百种
+        尺寸，resv 一路顶穿显存。这里把每条样本长度向上取整到档位，
+        T 与 B 都由档位定死，形状种类骤减喵。
+        条数还受 max_prompts 卡顶：短档位一条 16 token 的样本占不到
+        预算的 1%，若不卡顶一批会塞进几百条短句喵。
+    """
+    tier_B = [max(1, budget // t) for t in tiers]
+    slots: list[list[int]] = [[] for _ in tiers]
+    for idx in sorted(indices, key=lambda i: int(lengths[i])):
+        n = int(lengths[idx])
+        # 超过最大档位的样本独占一批，B=1，形状单独一种（数据里极少）
+        if n > tiers[-1]:
+            slots.append([idx])
+            tier_B.append(1)
+            continue
+        t = min(t for t in tiers if t >= n)
+        k = tier_B[tiers.index(t)]
+        if len(slots[tiers.index(t)]) + 1 > min(max_prompts, k):
+            slots.append([idx])
+            tier_B.append(k)
+        else:
+            slots[tiers.index(t)].append(idx)
+
+    # 档位之间打乱，避免相邻步的形状与长度单调
+    order = rng.permutation(len(slots))
+    return [slots[i] for i in order]
+
+
 def _cka_fp32(student: torch.Tensor, teacher: torch.Tensor, eps: float = 1e-8) -> float:
     """算一批 token 的线性 CKA喵。
 
@@ -586,12 +657,10 @@ class _BatchPrefetcher:
         batches,
         depth: int = 2,
         packed: bool = False,
-        pad_to: int = 0,
     ) -> None:
         self._queue: queue.Queue = queue.Queue(maxsize=depth)
         self._stop = threading.Event()
         self._packed = packed
-        self._pad_to = pad_to
         self._thread = threading.Thread(
             target=self._produce,
             args=(reader, tokenizer, texts, id_cache, batches),
@@ -606,11 +675,11 @@ class _BatchPrefetcher:
     def _produce(self, reader, tokenizer, texts, id_cache, batches) -> None:
         """后台循环：读一批、分一批、塞进队列喵。
 
-        输入: 读取器、分词器、文本表、预分词缓存、批次列表
+        输入: 读取器、分词器、文本表、预分词缓存、批次列表（`(批, pad_to)` 二元组）
         输出: 无（写队列）
         预期: 队列满时阻塞等主线程取走；结束时塞一个 `None` 当哨兵喵
         """
-        for batch in batches:
+        for batch, pad_to in batches:
             if self._stop.is_set():
                 break
             teachers = reader.read(batch)
@@ -619,14 +688,20 @@ class _BatchPrefetcher:
                 if self._packed:
                     prepared = make_packed_batch(
                         tokenizer, [texts[i] for i in batch], teachers, id_seqs,
-                        pad_to=self._pad_to,
+                        pad_to=pad_to,
                     )
                 else:
                     prepared = make_batch(
-                        tokenizer, [texts[i] for i in batch], teachers, id_seqs
+                        tokenizer, [texts[i] for i in batch], teachers, id_seqs,
+                        pad_to=pad_to,
                     )
             except RuntimeError:
                 prepared = None
+            except Exception:
+                # 后台线程异常若直接逃逸，主线程会永远等不到哨兵而假死；
+                # 这里统一降级成「该批不可用」，训练循环按 skipped 处理喵
+                self._queue.put((batch, None))
+                continue
             self._queue.put((batch, prepared))
         try:
             self._queue.put((None, None), timeout=1.0)
@@ -698,20 +773,38 @@ def train_finetune(
     result = FinetuneResult(steps=0)
     peft_model.train()
     started = time.time()
+    last_log_t, last_log_step = started, 0
     best = -1.0
     step = 0
     skipped = 0
 
     while step < config.steps:
-        batches = (
-            build_packed_batches(train_idx, reader.lengths, config.batch_tokens, rng)
-            if config.packed
-            else build_length_batches(train_idx, reader.lengths, config.batch_tokens, rng)
-        )
-        prefetcher = _BatchPrefetcher(
-            reader, tokenizer, texts, id_cache, batches, packed=config.packed,
-            pad_to=config.batch_tokens if config.packed else 0,
-        ).start()
+        if config.packed:
+            batches = build_packed_batches(train_idx, reader.lengths, config.batch_tokens, rng)
+            work = [(b, config.batch_tokens) for b in batches]
+            prefetcher = _BatchPrefetcher(
+                reader, tokenizer, texts, id_cache, work, packed=True,
+            ).start()
+        else:
+            batches = build_tier_batches(
+                train_idx, reader.lengths, config.batch_tokens, rng, config.pad_tiers
+            )
+            # 每批带着自己的档位走：同档所有批 pad 到同一 T，形状恒为
+            # B_tier x T_tier，分配器看到的尺寸种类就是档位数喵
+            tier_map = {t: max(1, config.batch_tokens // t) for t in config.pad_tiers}
+            work: list[tuple[list[int], int]] = []
+            for batch in batches:
+                longest = max(reader.lengths[i] for i in batch)
+                tier = next((x for x in config.pad_tiers if x >= longest), longest)
+                if longest > config.pad_tiers[-1]:
+                    tier = longest  # 超档位独占批，按批内最长补
+                elif len(batch) < min(256, tier_map[tier]):
+                    # 未填满的档尾批也补到档位，形状种类不增喵
+                    pass
+                work.append((batch, tier))
+            prefetcher = _BatchPrefetcher(
+                reader, tokenizer, texts, id_cache, work,
+            ).start()
         for _batch, prepared in prefetcher:
             if step >= config.steps:
                 prefetcher.stop()
@@ -773,14 +866,16 @@ def train_finetune(
             del taps_out, hidden_full, hidden, teacher_flat, loss
 
             if step % config.log_every == 0 or step == 1:
-                record = {"step": step, **parts, "sec": round(time.time() - started, 1)}
+                now = time.time()
+                record = {"step": step, **parts, "sec": round(now - started, 1)}
                 result.history.append(record)
+                sec_per_step = (now - last_log_t) / (step - last_log_step)
                 print(f"step {step:>5} loss {parts['loss']:.6f} cka {parts['cka']:.6f} "
                       f"col {parts['collapse']:.4f} "
-                      f"{time.time() - started:.1f}s "
+                      f"{sec_per_step:.2f}s/step "
                       f"alloc {torch.cuda.memory_allocated() / 2**30:.2f} "
-                      f"resv {torch.cuda.memory_reserved() / 2**30:.2f} "
-                      f"free {torch.cuda.mem_get_info()[0] / 2**30:.2f}", flush=True)
+                      f"resv {torch.cuda.memory_reserved() / 2**30:.2f}", flush=True)
+                last_log_t, last_log_step = now, step
 
             if config.eval_every and step % config.eval_every == 0:
                 cka = evaluate_cka(peft_model, tokenizer, reader, texts, val_idx,
@@ -939,6 +1034,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="单步 token 预算（不含 padding）")
     parser.add_argument("--packed", action="store_true",
                         help="训练批也走变长打包、不补 padding；需要 flash-attn")
+    parser.add_argument("--pad-tiers", default=None,
+                        help="档位切批的固定长度档，逗号分隔（如 128,256,512,1024,2048）；"
+                             "默认按 batch-tokens 自动生成几何档喵")
     parser.add_argument("--val-tokens", type=int, default=40000,
                         help="验证集最多用多少 token")
     parser.add_argument("--eval-every", type=int, default=0,
@@ -999,13 +1097,31 @@ def main(argv: list[str] | None = None) -> int:
 
     train_tokens = sum(lengths[i] for i in train_idx)
     # 步数按真实批数算：短句多的一轮批数远多于「token/预算」，不能拿理论值估喵
-    plan = (build_packed_batches if args.packed else build_length_batches)(
-        train_idx, lengths, args.batch_tokens, np.random.default_rng(0)
-    )
+    if args.packed:
+        plan = build_packed_batches(
+            train_idx, lengths, args.batch_tokens, np.random.default_rng(0)
+        )
+    else:
+        plan_tiers = tiers or tuple(default_pad_tiers(args.batch_tokens))
+        plan = build_tier_batches(
+            train_idx, lengths, args.batch_tokens, np.random.default_rng(0),
+            list(plan_tiers),
+        )
     steps = args.steps or max(1, len(plan) * max(1, args.epochs))
     print(f"训练 {len(train_idx)} 条 / {train_tokens:,} token；"
           f"验证 {len(val_idx)} 条 / {used:,} token；"
           f"每轮 {len(plan)} 批，共 {steps} 步 x {args.batch_tokens} token", flush=True)
+
+    tiers: tuple[int, ...] | None = None
+    if not args.packed:
+        if args.pad_tiers:
+            tiers = tuple(int(t) for t in args.pad_tiers.split(",") if t.strip())
+            if any(t1 >= t2 for t1, t2 in zip(tiers, tiers[1:])):
+                print("档位必须严格升序喵", flush=True)
+                return 2
+        else:
+            tiers = tuple(default_pad_tiers(args.batch_tokens))
+        print(f"档位 {list(tiers)}", flush=True)
 
     reader = PromptFeatureReader(features, lengths, starts, d_out)
     enc = StudentEncoder(
@@ -1030,6 +1146,7 @@ def main(argv: list[str] | None = None) -> int:
         steps=steps,
         batch_tokens=args.batch_tokens,
         packed=args.packed,
+        pad_tiers=tiers,
         eval_every=args.eval_every,
         lora_r=args.lora_r,
         lr_lora=args.lr,
