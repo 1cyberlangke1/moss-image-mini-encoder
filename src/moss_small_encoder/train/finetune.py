@@ -605,7 +605,10 @@ class _BatchPrefetcher:
             except RuntimeError:
                 prepared = None
             self._queue.put((batch, prepared))
-        self._queue.put((None, None))
+        try:
+            self._queue.put((None, None), timeout=1.0)
+        except queue.Full:
+            pass
 
     def __iter__(self):
         """按批产出 `(batch, prepared)`，遇到哨兵结束喵。"""
@@ -616,8 +619,22 @@ class _BatchPrefetcher:
             yield batch, prepared
 
     def stop(self) -> None:
-        """通知后台线程停下喵。"""
+        """通知后台线程停下，并等它真正退出喵。
+
+        输入: 无
+        输出: 无
+        预期: 返回时后台线程已结束，调用方随后关闭特征文件才是安全的喵
+
+        Notes:
+            队列满时后台线程会阻塞在 `put` 上，先抽干队列让它走到下一次停止判断喵。
+        """
         self._stop.set()
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        self._thread.join(timeout=5.0)
 
 
 def train_finetune(
@@ -959,7 +976,12 @@ def main(argv: list[str] | None = None) -> int:
           f"每轮 {len(plan)} 批，共 {steps} 步 x {args.batch_tokens} token", flush=True)
 
     reader = PromptFeatureReader(features, lengths, starts, d_out)
-    enc = StudentEncoder(args.student, device=args.device, dtype=torch.bfloat16)
+    enc = StudentEncoder(
+        args.student,
+        device=args.device,
+        dtype=torch.bfloat16,
+        attn="flash_attention_2" if args.packed else "sdpa",
+    )
     tokenizer = MossTokenizer.from_file(args.tokenizer)
 
     id_cache = None

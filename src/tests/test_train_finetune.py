@@ -8,10 +8,13 @@
 
 from __future__ import annotations
 
+import inspect
+
 import numpy as np
 import pytest
 import torch
 
+from moss_small_encoder.encode.student import StudentEncoder
 from moss_small_encoder.train.finetune import (
     PAD_ID,
     FinetuneConfig,
@@ -153,6 +156,40 @@ def test_prefetcher_marks_mismatched_batch() -> None:
 
     assert len(out) == 1
     assert out[0][1] is None
+
+
+def test_prefetcher_stop_waits_for_thread() -> None:
+    """stop() 返回时后台线程必须已退出喵。
+
+    输入: 批数远多于队列深度、消费端只取一批的预取器
+    输出: `stop()` 的副作用
+    预期: 线程不再存活；否则训练收尾先关特征文件会抛
+          `ValueError: I/O operation on closed file`喵
+    """
+    tokenizer = FakeTokenizer()
+    texts = ["abc"] * 40
+    reader = FakeReader([3] * 40)
+    prefetcher = _BatchPrefetcher(
+        reader, tokenizer, texts, None, [[i] for i in range(40)]
+    ).start()
+
+    next(iter(prefetcher))
+    prefetcher.stop()
+
+    assert not prefetcher._thread.is_alive()
+
+
+def test_student_encoder_exposes_attn_switch() -> None:
+    """学生编码器必须能改注意力后端喵。
+
+    输入: `StudentEncoder.__init__` 的签名
+    输出: 无
+    预期: 默认仍是 `sdpa`，且存在 `attn` 形参；打包训练靠它切到
+          `flash_attention_2`，否则 `cu_seq_lens` 被忽略、各条互相看见喵
+    """
+    params = inspect.signature(StudentEncoder.__init__).parameters
+    assert "attn" in params
+    assert params["attn"].default == "sdpa"
 
 
 def test_distill_loss_matches_numpy_reference() -> None:

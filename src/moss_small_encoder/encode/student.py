@@ -34,6 +34,8 @@ class StudentEncoder:
         dtype: 输出 dtype。
         quant_path: 量化权重文件（`comfy_kitchen` 格式）。给定时走量化装载路径，
             transformers 装不了这类张量，必须复用 teacher 的 `QuantLinear` 路径喵。
+        attn: 注意力实现名。默认 `sdpa`；传 `flash_attention_2` 才能让变长打包生效，
+            因为 sdpa 不认 `cu_seq_lens`，会把整批当成一条序列互相看见喵。
 
     Attributes:
         model: `Qwen3_5TextModel`，全部参数冻结。
@@ -52,12 +54,13 @@ class StudentEncoder:
         device: str | torch.device = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         quant_path: Path | str | None = None,
+        attn: str = "sdpa",
     ) -> None:
         model_dir = Path(model_dir)
         self.device = torch.device(device)
         self.dtype = dtype
         config = build_config(model_dir / "config.json")
-        config._attn_implementation = "sdpa"
+        config._attn_implementation = attn
 
         if quant_path is None:
             model = Qwen3_5TextModel(config)
