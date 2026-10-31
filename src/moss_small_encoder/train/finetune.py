@@ -87,6 +87,7 @@ class FinetuneConfig:
     grad_clip: float = 1.0
     log_every: int = 10
     save_every: int = 50
+    keep_last: int = 0
     min_lr_ratio: float = 0.01
     seed: int = 20261027
 
@@ -888,7 +889,7 @@ def train_finetune(
                     print(f"  最优更新 -> {cka:.5f}", flush=True)
 
             if config.save_every and step % config.save_every == 0:
-                save_checkpoint(peft_model, opt, sched, step, out_dir)
+                save_checkpoint(peft_model, opt, sched, step, out_dir, config.keep_last)
 
     result.steps = step
     peft_model.save_pretrained(str(out_dir / "lora"))
@@ -964,8 +965,20 @@ def self_check(
     return parts
 
 
-def save_checkpoint(peft_model, opt, sched, step: int, out_dir: Path) -> None:
-    """存一份断点，含 LoRA、优化器与调度器状态喵。"""
+def save_checkpoint(
+    peft_model, opt, sched, step: int, out_dir: Path, keep_last: int = 0
+) -> None:
+    """存一份断点，含 LoRA、优化器与调度器状态喵。
+
+    输入: PeftModel、优化器、调度器、当前步、输出目录、保留最近几份断点
+    输出: 落盘 `checkpoint_step_XXXXXX.pt` 与 `lora_step_XXXXXX/`，
+        `keep_last > 0` 时删掉更早的 `checkpoint_step_*.pt`（LoRA 目录保留）
+    预期: 断电最多丢 `save_every` 步；磁盘占用被 `keep_last` 封顶喵
+
+    Notes:
+        完整断点（63 MB/份）只服务 `--resume`，旧的根本用不上；
+        LoRA 目录（31 MB/份）是训练产物本身，全保留喵。
+    """
     path = out_dir / f"checkpoint_step_{step:06d}.pt"
     torch.save(
         {
@@ -976,6 +989,10 @@ def save_checkpoint(peft_model, opt, sched, step: int, out_dir: Path) -> None:
         path,
     )
     peft_model.save_pretrained(str(out_dir / f"lora_step_{step:06d}"))
+    if keep_last > 0:
+        olds = sorted(out_dir.glob("checkpoint_step_*.pt"))
+        for old in olds[:-keep_last] if len(olds) > keep_last else []:
+            old.unlink(missing_ok=True)
     print(f"  checkpoint -> {path.name}", flush=True)
 
 
@@ -1048,6 +1065,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=0,
                         help="每多少步存一次断点；0 表示只在最优点与结束时存")
+    parser.add_argument("--keep-last", type=int, default=0,
+                        help="断点轮转：只保留最近 N 份 checkpoint_step_*.pt；"
+                             "0 表示全保留。LoRA 目录不受影响，全保留喵")
     parser.add_argument("--merge", action="store_true",
                         help="把 LoRA 合并进主干并写到 --out/merged 喵")
     parser.add_argument("--lora", default="lora",
@@ -1152,6 +1172,7 @@ def main(argv: list[str] | None = None) -> int:
         cka_bf16=args.cka_bf16,
         log_every=args.log_every,
         save_every=args.save_every,
+        keep_last=args.keep_last,
     )
     if args.merge:
         from peft import PeftModel

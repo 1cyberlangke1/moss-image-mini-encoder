@@ -14,6 +14,8 @@ import numpy as np
 import pytest
 import torch
 
+from pathlib import Path
+
 from moss_small_encoder.encode.student import StudentEncoder
 from moss_small_encoder.train.finetune import (
     PAD_ID,
@@ -243,3 +245,35 @@ def test_distill_loss_zero_cka_when_teacher_equals_student() -> None:
 def test_distill_loss_rejects_token_mismatch() -> None:
     with pytest.raises(ValueError):
         distill_loss(torch.randn(5, 4), torch.randn(6, 3), FinetuneConfig())
+
+
+def test_save_checkpoint_keep_last_rotates(tmp_path) -> None:
+    """keep_last 要把旧的完整断点删掉、LoRA 目录保留喵。
+
+    输入: keep_last=2，连存三份
+    输出: out_dir 里的文件
+    预期: 只剩最近两份 checkpoint_step_*.pt，三份 lora_step_* 都在喵
+    """
+    from moss_small_encoder.train.finetune import save_checkpoint
+
+    class _FakePeft:
+        @staticmethod
+        def save_pretrained(path: str) -> None:
+            Path(path).mkdir(parents=True, exist_ok=True)
+            Path(path, "adapter.safetensors").write_bytes(b"x")
+
+    class _FakeOpt:
+        def state_dict(self):
+            return {}
+
+    class _FakeSched:
+        def state_dict(self):
+            return {}
+
+    for step in (100, 200, 300):
+        save_checkpoint(_FakePeft(), _FakeOpt(), _FakeSched(), step, tmp_path, keep_last=2)
+
+    ckpts = sorted(p.name for p in tmp_path.glob("checkpoint_step_*.pt"))
+    loras = sorted(p.name for p in tmp_path.glob("lora_step_*"))
+    assert ckpts == ["checkpoint_step_000200.pt", "checkpoint_step_000300.pt"]
+    assert len(loras) == 3
