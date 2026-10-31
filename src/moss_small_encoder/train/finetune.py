@@ -967,7 +967,7 @@ def main(argv: list[str] | None = None) -> int:
 
     train_tokens = sum(lengths[i] for i in train_idx)
     # 步数按真实批数算：短句多的一轮批数远多于「token/预算」，不能拿理论值估喵
-    plan = build_length_batches(
+    plan = (build_packed_batches if args.packed else build_length_batches)(
         train_idx, lengths, args.batch_tokens, np.random.default_rng(0)
     )
     steps = args.steps or max(1, len(plan) * max(1, args.epochs))
