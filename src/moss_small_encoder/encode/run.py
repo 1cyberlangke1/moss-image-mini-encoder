@@ -650,6 +650,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="只重提学生特征，复用 --out 里已有的 teacher.raw 与 sink.npy",
     )
+    parser.add_argument(
+        "--teacher-only",
+        action="store_true",
+        help="只跑教师遍并写 meta.json，跳过学生遍（微调时学生现算，Ridge 初值可复用旧的）",
+    )
     parser.add_argument("--tap", type=int, default=-1, help="student 取哪一层（单层）")
     parser.add_argument(
         "--taps",
@@ -706,17 +711,23 @@ def main(argv: list[str] | None = None) -> int:
             args.teacher_budget,
             args.teacher_max_prompts,
         )
-    student_seconds = _run_student_pass(
-        rows,
-        tokenizer,
-        args.out,
-        device,
-        student_budget,
-        args.student_max_prompts,
-        taps,
-        args.student_dir,
-        args.student_quant,
-    )
+    if args.teacher_only:
+        # 微调时学生是从文本现算的，student.raw 只在求 Ridge 初值时才用得上；
+        # 跳过这一遍省 1.5 小时和 253 GB，meta 里的 d_in 用 taps x hidden 直接算喵。
+        student_seconds = 0.0
+        print("[student] --teacher-only：跳过学生遍（微调时学生现算）", flush=True)
+    else:
+        student_seconds = _run_student_pass(
+            rows,
+            tokenizer,
+            args.out,
+            device,
+            student_budget,
+            args.student_max_prompts,
+            taps,
+            args.student_dir,
+            args.student_quant,
+        )
 
     np.save(args.out / "sink.npy", sink)
     meta = {

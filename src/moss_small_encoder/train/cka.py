@@ -62,7 +62,7 @@ def linear_cka(student: torch.Tensor, teacher: torch.Tensor, eps: float = 1e-8) 
 
 
 def cka_loss(student: torch.Tensor, teacher: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """`1 - CKA`，可以直接当损失反传。
+    """`1 - sqrt(CKA)`，可以直接当损失反传。
 
     Args:
         student: `[N, dS]`，需要带梯度。
@@ -76,11 +76,19 @@ def cka_loss(student: torch.Tensor, teacher: torch.Tensor, eps: float = 1e-8) ->
         官方实现用的是 `1 - sqrt(CKA)`，即 `1 - ‖HtᵀHs‖/sqrt(‖HsᵀHs‖·‖HtᵀHt‖)`。
         用 sqrt 而不是 CKA 本身，是因为梯度在 CKA 接近 1 时更稳：
         `d(1-x²)/dx` 在 x=1 附近为 0，会卡住；`d(1-x)/dx` 恒为 -1喵。
+
+        **梯度路径用 float32，不用 float64**：这个损失每步要做
+        `‖sᵀs‖_F`（dS×dS 的 Gram）三次，代价是 `N·dS²`。
+        在 RTX 4060 上 dS=6144、N≈3000 时是 237 GFLOP/次，
+        Ada 消费卡的 fp64 只有 fp32 的 1/64，实测单步直接掉到
+        42 秒、功耗 29 W（纯 fp64 空转），完全跑不动喵。
+        fp32 累加 37.7M 个平方项的相对误差约 6e-4，落到损失上约 3e-4，
+        相对 0.17 量级的损失可以忽略；需要精确读数时用 `linear_cka`（float64）喵。
     """
     if student.shape[0] != teacher.shape[0]:
         raise ValueError(f"token 数不一致：{student.shape[0]} vs {teacher.shape[0]}")
-    s = student.reshape(-1, student.shape[-1]).to(torch.float64)
-    t = teacher.reshape(-1, teacher.shape[-1]).to(torch.float64)
+    s = student.reshape(-1, student.shape[-1]).to(torch.float32)
+    t = teacher.reshape(-1, teacher.shape[-1]).to(torch.float32)
     s = s - s.mean(dim=0, keepdim=True)
     t = t - t.mean(dim=0, keepdim=True)
     return 1.0 - _norm_ratio(s, t, eps)
