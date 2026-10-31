@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 import torch
@@ -154,6 +156,43 @@ def test_require_packed_deps_rejects_missing_kernel(monkeypatch) -> None:
         teacher_module._require_packed_deps()
 
 
+def test_teacher_pass_aborts_and_backs_up_on_invalid_resume(tmp_path) -> None:
+    """进度校验不通过且盘上已有特征时，必须停下来而不是删进度。
+
+    输入: 一个非空的 teacher.raw，加一份指纹对不上的进度文件
+    输出: SystemExit；teacher.raw 原样保留；进度被复制成 .bak
+    预期: 这条路上不能删 progress.json 和 sink_sum.npy，
+          否则恢复所需的偏移和 sink 累计会一起消失
+    """
+    from moss_small_encoder.encode.run import _run_teacher_pass
+
+    rows = [{"id": "p0", "text": "t0", "n_tokens": 2}]
+    raw = tmp_path / "teacher.raw"
+    raw.write_bytes(b"\x00" * 16)
+    (tmp_path / "teacher.sink_sum.npy").write_bytes(b"\x00")
+    progress = {
+        "done": 1,
+        "tokens": 2,
+        "bytes": 16,
+        "lengths": [2],
+        "sink_count": 1,
+        "total": 1,
+        "fingerprint": "deadbeef",
+        "settings": {},
+    }
+    (tmp_path / "teacher.progress.json").write_text(
+        json.dumps(progress), encoding="utf-8"
+    )
+
+    with pytest.raises(SystemExit):
+        _run_teacher_pass(rows, None, tmp_path, torch.device("cpu"), 2048, 64)
+
+    assert raw.read_bytes() == b"\x00" * 16
+    assert (tmp_path / "teacher.progress.json.bak").exists()
+    assert (tmp_path / "teacher.progress.json").exists()
+    assert (tmp_path / "teacher.sink_sum.npy").exists()
+
+
 def _stored_and_teacher(tmp_path, scale: float):
     """造一份已写入特征与一个返回同内容的教师替身。
 
@@ -191,6 +230,8 @@ def test_verify_packed_passes_when_identical(tmp_path) -> None:
     assert metrics["samples"] == 2
     assert metrics["tokens"] == (4 - 1) + (3 - 1)
     assert metrics["mean"] > 0.9999
+    assert metrics["token_mean"] > 0.9999
+    assert metrics["token_min"] > 0.9999
     assert metrics["max_abs"] < 1e-6
 
 

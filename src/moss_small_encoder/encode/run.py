@@ -408,7 +408,7 @@ def _verify_packed_against_stored(
         min_token: 单条余弦均值的下限。
 
     Returns:
-        `{"samples", "tokens", "mean", "min", "max_abs"}`。
+        `{"samples", "tokens", "mean", "min", "token_mean", "token_min", "max_abs"}`。
 
     Raises:
         SystemExit: 读取不完整、分词长度与记录不符、或余弦不达标。
@@ -454,6 +454,7 @@ def _verify_packed_against_stored(
     got_all = hidden[0].to(torch.float64).cpu().numpy()
 
     per_prompt: list[float] = []
+    per_token: list[float] = []
     max_abs = 0.0
     tokens = 0
     for index, ids in enumerate(encoded):
@@ -465,7 +466,9 @@ def _verify_packed_against_stored(
         ref = blocks[index][1:length].astype(np.float64)
         numerator = (got * ref).sum(axis=1)
         denominator = np.linalg.norm(got, axis=1) * np.linalg.norm(ref, axis=1) + 1e-12
-        per_prompt.append(float((numerator / denominator).mean()))
+        cosines = numerator / denominator
+        per_token.extend(float(value) for value in cosines)
+        per_prompt.append(float(cosines.mean()))
         max_abs = max(max_abs, float(np.abs(got - ref).max()))
         tokens += length - 1
 
@@ -477,6 +480,10 @@ def _verify_packed_against_stored(
         "mean": float(np.mean(per_prompt)),
         "min": float(np.min(per_prompt)),
         "max_abs": max_abs,
+        # 逐 token 的最差项单独记：按条平均会把个别崩掉的 token 平掉，
+        # 但最大绝对差一旦异常大，就说明存在这种点，必须看得见。
+        "token_mean": float(np.mean(per_token)),
+        "token_min": float(np.min(per_token)),
     }
     if metrics["mean"] < min_mean or metrics["min"] < min_token:
         raise SystemExit(
@@ -526,21 +533,26 @@ def _run_teacher_pass(
         sidecar=sink_path,
         row_lengths=[int(row["n_tokens"]) for row in rows],
     ):
-        # 样本集、设置或磁盘产物对不上，进度作废，从头来。
+        raw_path = out_dir / "teacher.raw"
+        if raw_path.exists() and raw_path.stat().st_size > 0:
+            # 已有特征在盘上而进度对不上：这时删进度等于放行一次从头覆盖，
+            # 所以先把进度现状备份下来，再停下来等人确认。
+            backup = progress_path.with_name(progress_path.name + ".bak")
+            try:
+                backup.write_bytes(progress_path.read_bytes())
+            except OSError as error:
+                print(f"[teacher] 进度备份失败: {error}", flush=True)
+            raise SystemExit(
+                f"{raw_path} 已有 {raw_path.stat().st_size} 字节，但进度校验不通过，"
+                f"已把进度备份为 {backup.name}，未改动任何已有特征"
+            )
+        # 样本集、设置或磁盘产物对不上，且盘上没有已写特征，进度作废，从头来。
         resume = None
         progress_path.unlink(missing_ok=True)
         sink_path.unlink(missing_ok=True)
 
     start = int(resume["done"]) if resume else 0
     lengths: list[int] = list(resume["lengths"]) if resume else []
-    if resume:
-        # 续跑前留一份进度快照。之后要是指纹或字节数对不上，
-        # 靠这份 .bak 还能手工找回偏移，而不是只能从头再来。
-        backup = progress_path.with_name(progress_path.name + ".bak")
-        try:
-            backup.write_bytes(progress_path.read_bytes())
-        except OSError as error:
-            print(f"[teacher] 进度备份失败，继续执行: {error}", flush=True)
     sink_sum = (
         np.load(sink_path).astype(np.float64)
         if resume and sink_path.exists()
@@ -565,7 +577,8 @@ def _run_teacher_pass(
         )
         print(
             f"[teacher] packed 对拍通过：{metrics['samples']} 条 / {metrics['tokens']:,} token，"
-            f"余弦均值 {metrics['mean']:.6f} 最小 {metrics['min']:.6f}，"
+            f"按条余弦 均值 {metrics['mean']:.6f} 最小 {metrics['min']:.6f}，"
+            f"逐 token 余弦 均值 {metrics['token_mean']:.6f} 最小 {metrics['token_min']:.6f}，"
             f"最大绝对差 {metrics['max_abs']:.4f}",
             flush=True,
         )
