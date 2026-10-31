@@ -111,6 +111,72 @@ class FinetuneResult:
         return self.history[-1] if self.history else {}
 
 
+def decoder_layers(model):
+    """取出 PeftModel 或裸模型里的解码层列表喵。
+
+    输入: `PeftModel` 或 `Qwen3_5TextModel`
+    输出: `ModuleList`，每个元素是一层解码层
+    预期: 兼容 `PeftModel.base_model.model.layers` 与 `model.layers` 两种结构
+    """
+    inner = getattr(model, "base_model", model)
+    inner = getattr(inner, "model", inner)
+    layers = getattr(inner, "layers", None)
+    if layers is None:
+        raise AttributeError("模型里找不到 .layers，结构与本项目预期不符喵")
+    return layers
+
+
+def collect_tap_hidden(layers, taps: tuple[int, ...], run) -> list[torch.Tensor]:
+    """跑一次前向，只保留指定层的输出喵。
+
+    输入: 解码层列表、抽头下标、触发前向并返回模型输出的零参函数
+    输出: 与 `taps` 同序的张量列表
+    预期: 与 `output_hidden_states=True` 下的 `hidden_states[t]` 是同一批张量
+
+    Notes:
+        实测这个模型的 `hidden_states[t]` 是**第 t 层的输入**，也就是第 `t - 1` 层的输出，
+        所以正数抽头挂在该层输出的 hook 上；
+        `hidden_states[-1]` 是过完 final norm 的 `last_hidden_state`，不是最后一层的裸输出，
+        那一个必须从 `run()` 的返回值里取，挂 hook 会拿到错的东西喵。
+        验证脚本里两者最大绝对差为 0，而用最后一层裸输出会差 3.73喵。
+    """
+    count = len(layers)
+    wanted: dict[int, list[int]] = {}
+    for position, tap in enumerate(taps):
+        if tap < 0:
+            continue
+        if not 1 <= tap <= count - 1:
+            raise IndexError(
+                f"抽头 {tap} 无效：正数只能是 1 到 {count - 1}，"
+                f"{count} 等于层数时对应 final norm，请用 -1 表示喵"
+            )
+        wanted.setdefault(tap - 1, []).append(position)
+
+    captured: list[torch.Tensor | None] = [None] * len(taps)
+
+    def make_hook(index: int):
+        """给第 index 层造一个把输出写进 captured 的钩子喵。"""
+
+        def hook(module, args, output):
+            for position in wanted[index]:
+                captured[position] = output
+
+        return hook
+
+    handles = [layers[index].register_forward_hook(make_hook(index)) for index in wanted]
+    try:
+        out = run()
+    finally:
+        for handle in handles:
+            handle.remove()
+    for position, tap in enumerate(taps):
+        if tap < 0:
+            captured[position] = out.last_hidden_state
+    if any(item is None for item in captured):
+        raise RuntimeError("有抽头没抓到输出，前向可能没走到对应层喵")
+    return [item for item in captured if item is not None]
+
+
 def build_lora(model, config: FinetuneConfig):
     """给已冻结的主干挂 LoRA，返回 PeftModel 与可训练参数量喵。
 
@@ -392,10 +458,14 @@ def evaluate_cka(
                 continue
             input_ids = input_ids.to(device)
             mask = mask.to(device)
+
+            def run_forward():
+                """跑一次前向，抽头交给 hook 收集喵。"""
+                return model(input_ids=input_ids, attention_mask=mask, use_cache=False)
+
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                out = model(input_ids=input_ids, attention_mask=mask, use_cache=False,
-                            output_hidden_states=True)
-            hidden = torch.cat([out.hidden_states[t] for t in taps], dim=-1).float()
+                taps_out = collect_tap_hidden(decoder_layers(model), taps, run_forward)
+                hidden = torch.cat(taps_out, dim=-1).float()
             hidden = hidden[mask.bool()]
             teacher_flat = torch.cat(
                 [t[: int(n)] for t, n in zip(kept, mask.sum(1).tolist())], dim=0
@@ -529,12 +599,17 @@ def train_finetune(
             input_ids = input_ids.to(device)
             mask = mask.to(device)
 
+            def run_forward():
+                """跑一次学生前向，抽头交给 hook 收集喵。"""
+                return peft_model(
+                    input_ids=input_ids, attention_mask=mask, use_cache=False
+                )
+
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                out = peft_model(input_ids=input_ids, attention_mask=mask,
-                                 use_cache=False, output_hidden_states=True)
-                hidden_full = torch.cat(
-                    [out.hidden_states[t] for t in config.taps], dim=-1
-                ).float()
+                taps_out = collect_tap_hidden(
+                    decoder_layers(peft_model), config.taps, run_forward
+                )
+                hidden_full = torch.cat(taps_out, dim=-1).float()
             hidden = hidden_full[mask.bool()]
             teacher_flat = torch.cat(
                 [t[: int(n)] for t, n in zip(kept, mask.sum(1).tolist())], dim=0
@@ -549,7 +624,7 @@ def train_finetune(
             opt.step()
             sched.step()
             step += 1
-            del out, hidden_full, hidden, teacher_flat, loss
+            del taps_out, hidden_full, hidden, teacher_flat, loss
 
             if step % config.log_every == 0 or step == 1:
                 record = {"step": step, **parts, "sec": round(time.time() - started, 1)}
@@ -601,16 +676,24 @@ def self_check(
     mask = mask.to(device)
     kept = [t.to(device) for t in kept]
 
-    base = model(input_ids=input_ids, attention_mask=mask,
-                 use_cache=False, output_hidden_states=True)
-    base_h = torch.cat([base.hidden_states[t] for t in config.taps], dim=-1).float()
-    del base
+    def run_base():
+        """不挂 LoRA 的前向喵。"""
+        return model(input_ids=input_ids, attention_mask=mask, use_cache=False)
+
+    base_taps = collect_tap_hidden(decoder_layers(model), config.taps, run_base)
+    base_h = torch.cat(base_taps, dim=-1).float()
+    del base_taps
 
     peft_model, trainable, total = build_lora(model, config)
     peft_model.eval()
-    lora_out = peft_model(input_ids=input_ids, attention_mask=mask,
-                          use_cache=False, output_hidden_states=True)
-    lora_h = torch.cat([lora_out.hidden_states[t] for t in config.taps], dim=-1).float()
+
+    def run_lora():
+        """挂了 LoRA 的前向喵。"""
+        return peft_model(input_ids=input_ids, attention_mask=mask, use_cache=False)
+
+    lora_taps = collect_tap_hidden(decoder_layers(peft_model), config.taps, run_lora)
+    lora_h = torch.cat(lora_taps, dim=-1).float()
+    del lora_taps
     max_diff = float((lora_h - base_h).abs().max())
 
     hidden = base_h[mask.bool()]
