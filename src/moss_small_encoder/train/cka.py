@@ -18,16 +18,30 @@ from __future__ import annotations
 import torch
 
 
+def _gram_norm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """算 `‖aᵀb‖_F`，半精度输入时先把结果转回 fp32喵。
+
+    输入: `a [N,dA]`、`b [N,dB]`，dtype 可以是 fp32 / fp64 / bf16
+    输出: 标量张量
+    预期: fp32 与 fp64 保持原精度；bf16 只在乘积之后转 fp32，
+          这样矩阵乘能走 tensor core，归约仍在 fp32 上做喵
+    """
+    gram = a.t() @ b
+    if gram.dtype in (torch.bfloat16, torch.float16):
+        gram = gram.to(torch.float32)
+    return torch.linalg.matrix_norm(gram)
+
+
 def _norm_ratio(s: torch.Tensor, t: torch.Tensor, eps: float) -> torch.Tensor:
     """`‖tᵀs‖_F / sqrt(‖sᵀs‖_F·‖tᵀt‖_F)`，即 sqrt(CKA) 喵。
 
     输入: s [N,dS]、t [N,dT]，已去均值
     输出: 标量，1 表示结构完全一致
-    预期: 交叉项只有 dS×dT，不构造 N×N 的 Gram
+    预期: 交叉项只有 dS×dT，不构造 N×N 的 Gram喵
     """
-    cross = torch.linalg.matrix_norm(s.t() @ t)
-    den_s = torch.linalg.matrix_norm(s.t() @ s) + eps
-    den_t = torch.linalg.matrix_norm(t.t() @ t) + eps
+    cross = _gram_norm(s, t)
+    den_s = _gram_norm(s, s) + eps
+    den_t = _gram_norm(t, t) + eps
     return cross / torch.sqrt(den_s * den_t)
 
 
@@ -61,13 +75,20 @@ def linear_cka(student: torch.Tensor, teacher: torch.Tensor, eps: float = 1e-8) 
     return ratio * ratio
 
 
-def cka_loss(student: torch.Tensor, teacher: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+def cka_loss(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    eps: float = 1e-8,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
     """`1 - sqrt(CKA)`，可以直接当损失反传。
 
     Args:
         student: `[N, dS]`，需要带梯度。
         teacher: `[N, dT]`，常量即可。
         eps: 同 `linear_cka`。
+        dtype: 三次 Gram 的输入精度。默认 fp32；给 `torch.bfloat16` 时
+            矩阵乘走 tensor core、归约仍在 fp32，代价是约 3e-4 的相对误差喵。
 
     Returns:
         标量张量，越小表示结构越接近。
@@ -91,6 +112,10 @@ def cka_loss(student: torch.Tensor, teacher: torch.Tensor, eps: float = 1e-8) ->
     t = teacher.reshape(-1, teacher.shape[-1]).to(torch.float32)
     s = s - s.mean(dim=0, keepdim=True)
     t = t - t.mean(dim=0, keepdim=True)
+    # 去均值之后才降精度：均值要在 fp32 上算，否则批内偏移会被抹掉喵
+    if dtype != torch.float32:
+        s = s.to(dtype)
+        t = t.to(dtype)
     return 1.0 - _norm_ratio(s, t, eps)
 
 

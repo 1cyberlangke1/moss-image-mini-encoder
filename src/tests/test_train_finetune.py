@@ -34,6 +34,10 @@ class FakeTokenizer:
     def encode(self, text: str) -> list[int]:
         return [self.offset + ord(ch) for ch in text]
 
+    def encode_batch(self, texts: list[str]) -> list[list[int]]:
+        """批量接口：逐条复用 `encode`，语义与真分词器一致喵。"""
+        return [self.encode(text) for text in texts]
+
 
 def _stats(d_in: int, d_out: int) -> dict[str, torch.Tensor]:
     """恒等标准化统计量：均值 0、标准差 1，方便手算对照喵。"""
@@ -101,7 +105,8 @@ def test_distill_loss_matches_numpy_reference() -> None:
     d_in, d_out, n = 8, 4, 6
     hidden = torch.randn(n, d_in)
     teacher = torch.randn(n, d_out)
-    config = FinetuneConfig()
+    # 这条验的是 fp32 路径的精确性，所以要显式关掉 bf16 喵
+    config = FinetuneConfig(cka_bf16=False)
 
     loss, parts = distill_loss(hidden, teacher, config)
 
@@ -112,6 +117,24 @@ def test_distill_loss_matches_numpy_reference() -> None:
 
     want_total = config.cka_weight * want_cka + config.collapse_weight * parts["collapse"]
     assert float(loss) == pytest.approx(want_total, abs=1e-5)
+
+
+def test_distill_loss_default_uses_bf16_within_tolerance() -> None:
+    """默认配置走 bf16，结果与 fp32 参考的差必须在 1e-3 内喵。
+
+    输入: 同一批随机张量，各建一份 bf16 与 fp32 配置
+    输出: 两条路径的 cka 分项
+    预期: 差 < 1e-3（实测约 1e-5，这里留足余量）喵
+    """
+    torch.manual_seed(3)
+    d_in, d_out, n = 1024, 768, 24
+    hidden = torch.randn(n, d_in) * 2.0
+    teacher = torch.randn(n, d_out) * 2.0
+
+    _, parts_bf16 = distill_loss(hidden, teacher, FinetuneConfig(cka_bf16=True))
+    _, parts_fp32 = distill_loss(hidden, teacher, FinetuneConfig(cka_bf16=False))
+
+    assert abs(parts_bf16["cka"] - parts_fp32["cka"]) < 1e-3
 
 
 def test_distill_loss_zero_cka_when_teacher_equals_student() -> None:

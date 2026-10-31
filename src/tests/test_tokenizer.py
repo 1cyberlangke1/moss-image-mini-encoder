@@ -62,3 +62,18 @@ class TestMossTokenizer:
         ids = moss.encode(text)
         assert len(ids) > 20
         assert "abs_centralized" in moss.decode(ids)
+
+    def test_encode_batch_matches_per_item(self, moss):
+        """批量编码必须与逐条编码逐位相同喵。
+
+        输入: 中英混合、含 layout JSON 的四条提示词
+        输出: `encode_batch` 与逐条 `encode` 的结果
+        预期: 每个 id 都相同，长度也相同喵
+        """
+        texts = [
+            "a red ball on the table",
+            "一个穿汉服的女性站在桥边",
+            '{"summary":{"caption":"x"},"items":[]}',
+            "",
+        ]
+        assert moss.encode_batch(texts) == [moss.encode(t) for t in texts]
