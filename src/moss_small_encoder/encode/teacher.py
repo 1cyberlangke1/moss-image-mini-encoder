@@ -27,6 +27,7 @@ from transformers.utils import (
 )
 
 from .common import MODEL_PREFIX, build_config, restore_rope, restore_ssm_dtype
+from ..packing import packed_forward_kwargs
 
 from .quant import (
     build_int8_tensorwise,
@@ -340,25 +341,9 @@ class TeacherEncoder:
             `attention_mask` 传字典是为了跳过 mask 构造：varlen 分支要求它是 None。
         """
         lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        device = input_ids.device
-        positions = torch.cat(
-            [torch.arange(length, device=device, dtype=torch.long) for length in lengths]
-        )
-        position_ids = positions.view(1, 1, -1).expand(4, 1, -1)
-        seq_idx = torch.repeat_interleave(
-            torch.arange(len(lengths), device=device, dtype=torch.int32),
-            torch.tensor(lengths, device=device),
-        ).unsqueeze(0)
-
         out = self.model(
             input_ids=input_ids,
-            attention_mask={"full_attention": None, "linear_attention": None},
-            position_ids=position_ids,
-            cu_seq_lens_q=cu_seqlens,
-            cu_seq_lens_k=cu_seqlens,
-            max_length_q=max(lengths),
-            max_length_k=max(lengths),
-            seq_idx=seq_idx,
             use_cache=False,
+            **packing_forward_kwargs(cu_seqlens),
         )
         return out.last_hidden_state

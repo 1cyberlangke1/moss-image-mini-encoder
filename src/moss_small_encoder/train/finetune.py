@@ -47,6 +47,7 @@ import torch.nn.functional as F
 from safetensors.torch import load_file
 
 from .cka import cka_loss, pairwise_cosine_penalty
+from ..packing import packed_forward_kwargs
 
 # 与 encode 阶段一致的抽头层喵。
 TAPS_DEFAULT = (2, 4, 8, 12, 16, -1)
@@ -77,6 +78,7 @@ class FinetuneConfig:
     lr_lora: float = 1e-3
     steps: int = 200
     batch_tokens: int = 4096
+    packed: bool = False
     eval_every: int = 0
     cka_weight: float = 1.0
     cka_bf16: bool = True
@@ -292,6 +294,76 @@ def make_batch(
     return input_ids, mask, kept_teachers
 
 
+def build_packed_batches(
+    indices: list[int],
+    lengths: list[int],
+    budget: int,
+    rng: np.random.Generator,
+    max_prompts: int = 256,
+) -> list[list[int]]:
+    """按真实 token 数切批，打包不需要补齐喵。
+
+    输入: 候选下标、每条 token 数、单批真实 token 上限、随机数发生器、单批条数上限
+    输出: 批次列表，每批 `sum(lengths) <= budget`
+    预期: 不再因为批内最长长度而多留 padding，预算按真实 token 填满喵
+
+    Notes:
+        补齐版按 `条数 x 批内最长` 控预算，短句桶里 20 token 的样本会被 pad 到 31，
+        实测一个 epoch 白算 27 到 29 个百分点；打包版把这块省下来喵。
+    """
+    order = list(indices)
+    rng.shuffle(order)
+    batches: list[list[int]] = []
+    batch: list[int] = []
+    used = 0
+    for index in order:
+        count = int(lengths[index])
+        if batch and (used + count > budget or len(batch) + 1 > max_prompts):
+            batches.append(batch)
+            batch, used = [], 0
+        batch.append(index)
+        used += count
+    if batch:
+        batches.append(batch)
+    return batches
+
+
+def make_packed_batch(
+    tokenizer,
+    texts: list[str],
+    teachers: list[np.ndarray],
+    id_seqs: list[np.ndarray] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+    """把若干条 prompt 首尾相接成一个批，不做补齐喵。
+
+    输入: 分词器、文本列表、对应教师特征、可选的预分词 id 列表
+    输出: `(input_ids[1,total], cu_seqlens[N+1], teacher 列表)`
+    预期: 两边都切掉 token 0，拼接顺序与输入一致喵
+
+    Notes:
+        没有 pad 位置，所以损失侧也不需要再用 mask 过滤；
+        教师特征按同样的顺序切掉 token 0 后直接 cat 起来就是逐 token 对齐喵。
+    """
+    all_ids = tokenizer.encode_batch(texts) if id_seqs is None else id_seqs
+    flat: list[int] = []
+    bounds: list[int] = [0]
+    kept: list[torch.Tensor] = []
+    for ids, teacher in zip(all_ids, teachers):
+        if len(ids) != teacher.shape[0]:
+            continue
+        body = [int(token) for token in ids[1:]]
+        if not body:
+            continue
+        flat.extend(body)
+        bounds.append(bounds[-1] + len(body))
+        kept.append(torch.from_numpy(teacher[1:]))
+    if not kept:
+        raise RuntimeError("没有一条样本的 token 数与特征对齐喵")
+    input_ids = torch.tensor(flat, dtype=torch.long).unsqueeze(0)
+    cu_seqlens = torch.tensor(bounds, dtype=torch.int32)
+    return input_ids, cu_seqlens, kept
+
+
 def distill_loss(
     hidden: torch.Tensor,
     teacher_flat: torch.Tensor,
@@ -493,9 +565,11 @@ class _BatchPrefetcher:
         id_cache: "IdCache | None",
         batches,
         depth: int = 2,
+        packed: bool = False,
     ) -> None:
         self._queue: queue.Queue = queue.Queue(maxsize=depth)
         self._stop = threading.Event()
+        self._packed = packed
         self._thread = threading.Thread(
             target=self._produce,
             args=(reader, tokenizer, texts, id_cache, batches),
@@ -520,9 +594,14 @@ class _BatchPrefetcher:
             teachers = reader.read(batch)
             id_seqs = [id_cache.get(i) for i in batch] if id_cache is not None else None
             try:
-                prepared = make_batch(
-                    tokenizer, [texts[i] for i in batch], teachers, id_seqs
-                )
+                if self._packed:
+                    prepared = make_packed_batch(
+                        tokenizer, [texts[i] for i in batch], teachers, id_seqs
+                    )
+                else:
+                    prepared = make_batch(
+                        tokenizer, [texts[i] for i in batch], teachers, id_seqs
+                    )
             except RuntimeError:
                 prepared = None
             self._queue.put((batch, prepared))
@@ -584,9 +663,13 @@ def train_finetune(
     skipped = 0
 
     while step < config.steps:
-        batches = build_length_batches(train_idx, reader.lengths, config.batch_tokens, rng)
+        batches = (
+            build_packed_batches(train_idx, reader.lengths, config.batch_tokens, rng)
+            if config.packed
+            else build_length_batches(train_idx, reader.lengths, config.batch_tokens, rng)
+        )
         prefetcher = _BatchPrefetcher(
-            reader, tokenizer, texts, id_cache, batches
+            reader, tokenizer, texts, id_cache, batches, packed=config.packed
         ).start()
         for _batch, prepared in prefetcher:
             if step >= config.steps:
@@ -595,25 +678,45 @@ def train_finetune(
             if prepared is None:
                 skipped += 1
                 continue
-            input_ids, mask, kept = prepared
-            input_ids = input_ids.to(device)
-            mask = mask.to(device)
+            if config.packed:
+                input_ids, cu_seqlens, kept = prepared
+                input_ids = input_ids.to(device)
+                cu_seqlens = cu_seqlens.to(device)
+                packed_kwargs = packed_forward_kwargs(cu_seqlens)
 
-            def run_forward():
-                """跑一次学生前向，抽头交给 hook 收集喵。"""
-                return peft_model(
-                    input_ids=input_ids, attention_mask=mask, use_cache=False
-                )
+                def run_forward():
+                    """打包前向：整批是一条序列喵。"""
+                    return peft_model(
+                        input_ids=input_ids, use_cache=False, **packed_kwargs
+                    )
 
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                taps_out = collect_tap_hidden(
-                    decoder_layers(peft_model), config.taps, run_forward
-                )
-                hidden_full = torch.cat(taps_out, dim=-1).float()
-            hidden = hidden_full[mask.bool()]
-            teacher_flat = torch.cat(
-                [t[: int(n)] for t, n in zip(kept, mask.sum(1).tolist())], dim=0
-            ).to(device)
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    taps_out = collect_tap_hidden(
+                        decoder_layers(peft_model), config.taps, run_forward
+                    )
+                    hidden_full = torch.cat(taps_out, dim=-1).float()
+                hidden = hidden_full.reshape(-1, hidden_full.shape[-1])
+                teacher_flat = torch.cat([item.to(device) for item in kept], dim=0)
+            else:
+                input_ids, mask, kept = prepared
+                input_ids = input_ids.to(device)
+                mask = mask.to(device)
+
+                def run_forward():
+                    """补齐前向：抽头交给 hook 收集喵。"""
+                    return peft_model(
+                        input_ids=input_ids, attention_mask=mask, use_cache=False
+                    )
+
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    taps_out = collect_tap_hidden(
+                        decoder_layers(peft_model), config.taps, run_forward
+                    )
+                    hidden_full = torch.cat(taps_out, dim=-1).float()
+                hidden = hidden_full[mask.bool()]
+                teacher_flat = torch.cat(
+                    [t[: int(n)] for t, n in zip(kept, mask.sum(1).tolist())], dim=0
+                ).to(device)
 
             # 损失必须在 autocast 之外算：CKA 走 float32，余弦要稳定喵
             loss, parts = distill_loss(hidden, teacher_flat, config)
@@ -785,6 +888,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="总步数；0 表示按 epochs x 训练 token / batch_tokens 自动算")
     parser.add_argument("--batch-tokens", type=int, default=4096,
                         help="单步 token 预算（不含 padding）")
+    parser.add_argument("--packed", action="store_true",
+                        help="训练批也走变长打包、不补 padding；需要 flash-attn")
     parser.add_argument("--val-tokens", type=int, default=40000,
                         help="验证集最多用多少 token")
     parser.add_argument("--eval-every", type=int, default=0,
@@ -870,6 +975,7 @@ def main(argv: list[str] | None = None) -> int:
         taps=taps,
         steps=steps,
         batch_tokens=args.batch_tokens,
+        packed=args.packed,
         eval_every=args.eval_every,
         lora_r=args.lora_r,
         lr_lora=args.lr,
