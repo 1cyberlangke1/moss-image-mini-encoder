@@ -72,12 +72,10 @@ class FinetuneConfig:
     lora_alpha: int = 32
     lora_dropout: float = 0.05
     lr_lora: float = 1e-3
-    lr_head: float = 1e-4
     steps: int = 200
     batch_tokens: int = 4096
     eval_every: int = 0
     cka_weight: float = 1.0
-    cos_weight: float = 0.5
     collapse_weight: float = 0.05
     grad_clip: float = 1.0
     log_every: int = 10
@@ -132,25 +130,76 @@ def build_lora(model, config: FinetuneConfig):
     return peft_model, trainable, total
 
 
+class IdCache:
+    """可选的预分词缓存喵。
+
+    输入: 全量 token id（int32 一维数组）+ 每条 prompt 的偏移
+    输出: `get(i)` 返回第 i 条 prompt 的 token id 视图
+    预期: 训练时不再调用分词器；缓存文件小（1443 万 token 约 58 MB）
+
+    Notes:
+        分词与主干无关，训练三轮只需算一次喵。
+    """
+
+    def __init__(self, ids: np.ndarray, offsets: np.ndarray) -> None:
+        self._ids = ids
+        self._offsets = offsets
+
+    @classmethod
+    def load(cls, path: Path) -> "IdCache":
+        """从 npz 读缓存喵。
+
+        输入: 缓存路径
+        输出: `IdCache`
+        预期: 文件里必须有 `ids` 与 `offsets` 两个数组
+        """
+        data = np.load(str(path))
+        return cls(data["ids"], data["offsets"])
+
+    @classmethod
+    def build(cls, tokenizer, texts: list[str], path: Path) -> "IdCache":
+        """把全量 prompt 分词并落盘喵。
+
+        输入: 分词器、全部文本、缓存路径
+        输出: `IdCache`
+        预期: 写 npz（`ids` int32、`offsets` int64），返回可用的缓存
+        """
+        lengths = [len(tokenizer.encode(t)) for t in texts]
+        offsets = np.zeros(len(texts) + 1, dtype=np.int64)
+        np.cumsum(lengths, out=offsets[1:])
+        ids = np.empty(int(offsets[-1]), dtype=np.int32)
+        for i, text in enumerate(texts):
+            ids[offsets[i]:offsets[i + 1]] = tokenizer.encode(text)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(str(path), ids=ids, offsets=offsets)
+        return cls(ids, offsets)
+
+    def get(self, index: int) -> np.ndarray:
+        """取第 index 条 prompt 的 token id喵。"""
+        return self._ids[self._offsets[index]:self._offsets[index + 1]]
+
+
 def make_batch(
     tokenizer,
     texts: list[str],
     teachers: list[np.ndarray],
+    id_seqs: list[np.ndarray] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
     """把若干条 prompt 打成右 padding 的一个批喵。
 
-    输入: 分词器、文本列表、对应的教师特征
+    输入: 分词器、文本列表、对应的教师特征、可选的预分词 id 列表
     输出: `(input_ids[B,T], attention_mask[B,T], teacher 列表)`
     预期: 两边都切掉 token 0（attention sink），保持逐行对齐喵
 
     Notes:
         raw 里保留了 token 0，训练端由读取层跳过；这里同样剔除，
         否则 sink 那个范数上万的行会把 CKA 与余弦都带偏喵。
+        `id_seqs` 给出时直接用它，不再调用分词器喵。
     """
     seqs: list[torch.Tensor] = []
     kept_teachers: list[torch.Tensor] = []
-    for text, teacher in zip(texts, teachers):
-        ids = tokenizer.encode(text)
+    for pos, (text, teacher) in enumerate(zip(texts, teachers)):
+        ids = id_seqs[pos] if id_seqs is not None else tokenizer.encode(text)
         if len(ids) != teacher.shape[0]:
             continue
         seqs.append(torch.tensor(ids[1:], dtype=torch.long))
@@ -170,38 +219,21 @@ def make_batch(
 def distill_loss(
     hidden: torch.Tensor,
     teacher_flat: torch.Tensor,
-    head: torch.Tensor,
-    stats: dict[str, torch.Tensor],
     config: FinetuneConfig,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """算蒸馏损失与三个分项喵。
+    """算蒸馏损失喵。
 
-    输入: 学生 6 抽头拼接后的 `[N,d_in]`、教师 `[N,d_out]`、线性头、标准化统计量
-    输出: `(loss, 分项字典)`
-    预期: 分项都降下去才算真的学到，只降一项通常是塌缩的假象喵
+    输入: 学生 6 抽头拼接后的 `[N,d_in]`、教师 `[N,d_out]`、配置
+    输出: `(loss, 分项字典)`，含 `loss` / `cka` / `collapse`
+    预期: `loss = cka_weight·(1−CKA) + collapse_weight·塌缩正则`
     """
-    mean_in = stats["mean_in"]
-    std_in = stats["std_in"]
-    mean_out = stats["mean_out"]
-    std_out = stats["std_out"]
+    loss_cka = cka_loss(hidden, teacher_flat)
+    loss_col = pairwise_cosine_penalty(hidden)
 
-    h_std = (hidden - mean_in) / std_in
-    t_std = (teacher_flat - mean_out) / std_out
-
-    loss_cka = cka_loss(h_std, t_std)
-    pred = h_std @ head * std_out + mean_out
-    loss_cos = (1.0 - F.cosine_similarity(pred, teacher_flat, dim=-1)).mean()
-    loss_col = pairwise_cosine_penalty(h_std)
-
-    total = (
-        config.cka_weight * loss_cka
-        + config.cos_weight * loss_cos
-        + config.collapse_weight * loss_col
-    )
+    total = config.cka_weight * loss_cka + config.collapse_weight * loss_col
     return total, {
         "loss": float(total.detach()),
         "cka": float(loss_cka.detach()),
-        "cos_loss": float(loss_cos.detach()),
         "collapse": float(loss_col.detach()),
     }
 
@@ -292,36 +324,56 @@ def build_length_batches(
     return batches
 
 
-def evaluate_cosine(
+@torch.no_grad()
+def _cka_fp32(student: torch.Tensor, teacher: torch.Tensor, eps: float = 1e-8) -> float:
+    """算一批 token 的线性 CKA喵。
+
+    输入: 学生 `[N,dS]`、教师 `[N,dT]`，未去均值
+    输出: float，0~1
+    预期: 与 `cka_loss` 同一恒等式，不建图喵
+    """
+    s = student.reshape(-1, student.shape[-1]).float()
+    t = teacher.reshape(-1, teacher.shape[-1]).float()
+    s = s - s.mean(dim=0, keepdim=True)
+    t = t - t.mean(dim=0, keepdim=True)
+    cross = torch.linalg.matrix_norm(s.t() @ t)
+    den_s = torch.linalg.matrix_norm(s.t() @ s) + eps
+    den_t = torch.linalg.matrix_norm(t.t() @ t) + eps
+    ratio = cross / torch.sqrt(den_s * den_t)
+    return float(ratio * ratio)
+
+
+def evaluate_cka(
     model,
     tokenizer,
     reader: PromptFeatureReader,
     texts: list[str],
     indices: list[int],
-    stats: dict[str, torch.Tensor],
-    head: torch.Tensor,
     taps: tuple[int, ...],
     device: torch.device,
     budget: int,
+    id_cache: "IdCache | None" = None,
 ) -> float:
-    """在验证集上算投影后逐 token 余弦均值喵。
+    """在验证集上算学生与教师隐状态的线性 CKA喵。
 
-    输入: 主干、分词器、特征读取器、文本表、验证下标、标准化统计量、线性头、
-          抽头层、设备、单批 token 上限
-    输出: 余弦均值（-1~1，越大越好）
-    预期: 与 train/run.py 的验证口径一致，都是原始空间逐 token 余弦喵
+    输入: 主干、分词器、特征读取器、文本表、验证下标、抽头层、设备、单批 token 上限
+    输出: 按 token 数加权的 CKA 均值（0~1，越大越好）
+    预期: 不需要线性头，两边维度不同也能比
     """
     if not indices:
         return float("nan")
     model.eval()
-    cos_sum = 0.0
+    sum_cka = 0.0
     n_tok = 0
     with torch.no_grad():
         batches = build_length_batches(indices, reader.lengths, budget, np.random.default_rng(0))
         for batch in batches:
             teachers = reader.read(batch)
             try:
-                input_ids, mask, kept = make_batch(tokenizer, [texts[i] for i in batch], teachers)
+                id_seqs = [id_cache.get(i) for i in batch] if id_cache is not None else None
+                input_ids, mask, kept = make_batch(
+                    tokenizer, [texts[i] for i in batch], teachers, id_seqs
+                )
             except RuntimeError:
                 continue
             input_ids = input_ids.to(device)
@@ -334,12 +386,10 @@ def evaluate_cosine(
             teacher_flat = torch.cat(
                 [t[: int(n)] for t, n in zip(kept, mask.sum(1).tolist())], dim=0
             ).to(device)
-            pred = (hidden - stats["mean_in"]) / stats["std_in"] @ head * stats["std_out"] + stats["mean_out"]
-            cos = F.cosine_similarity(pred, teacher_flat, dim=-1)
-            cos_sum += float(cos.sum())
-            n_tok += int(cos.numel())
+            sum_cka += _cka_fp32(hidden, teacher_flat) * int(hidden.shape[0])
+            n_tok += int(hidden.shape[0])
     model.train()
-    return cos_sum / max(n_tok, 1)
+    return sum_cka / max(n_tok, 1)
 
 
 def train_finetune(
@@ -349,10 +399,10 @@ def train_finetune(
     texts: list[str],
     train_idx: list[int],
     val_idx: list[int],
-    adapter_path: Path,
     config: FinetuneConfig,
     out_dir: Path,
     device: str | torch.device = "cuda",
+    id_cache: "IdCache | None" = None,
 ) -> FinetuneResult:
     """跑流式微调循环喵。
 
@@ -370,22 +420,8 @@ def train_finetune(
     peft_model, trainable, total = build_lora(model, config)
     print(f"LoRA 可训练 {trainable:,} / 总 {total:,} = {trainable / total:.3%}", flush=True)
 
-    adapter = load_file(str(adapter_path))
-    stats = {
-        "mean_in": adapter["mean_in"].to(device, torch.float32),
-        "std_in": adapter["std_in"].to(device, torch.float32),
-        "mean_out": adapter["mean_out"].to(device, torch.float32),
-        "std_out": adapter["std_out"].to(device, torch.float32),
-    }
-    head = torch.nn.Parameter(adapter["weight"].to(device, torch.float32))
-
     params = [p for p in peft_model.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(
-        [
-            {"params": params, "lr": config.lr_lora, "weight_decay": 0.0},
-            {"params": [head], "lr": config.lr_head, "weight_decay": 0.0},
-        ]
-    )
+    opt = torch.optim.AdamW([{"params": params, "lr": config.lr_lora, "weight_decay": 0.0}])
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=config.steps, eta_min=config.lr_lora * config.min_lr_ratio
     )
@@ -405,8 +441,9 @@ def train_finetune(
                 break
             teachers = reader.read(batch)
             try:
+                id_seqs = [id_cache.get(i) for i in batch] if id_cache is not None else None
                 input_ids, mask, kept = make_batch(
-                    tokenizer, [texts[i] for i in batch], teachers
+                    tokenizer, [texts[i] for i in batch], teachers, id_seqs
                 )
             except RuntimeError:
                 skipped += 1
@@ -426,11 +463,11 @@ def train_finetune(
             ).to(device)
 
             # 损失必须在 autocast 之外算：CKA 走 float32，余弦要稳定喵
-            loss, parts = distill_loss(hidden, teacher_flat, head, stats, config)
+            loss, parts = distill_loss(hidden, teacher_flat, config)
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(params + [head], config.grad_clip)
+            torch.nn.utils.clip_grad_norm_(params, config.grad_clip)
             opt.step()
             sched.step()
             step += 1
@@ -440,43 +477,24 @@ def train_finetune(
                 record = {"step": step, **parts, "sec": round(time.time() - started, 1)}
                 result.history.append(record)
                 print(f"step {step:>5} loss {parts['loss']:.6f} cka {parts['cka']:.6f} "
-                      f"cos {parts['cos_loss']:.6f} col {parts['collapse']:.4f} "
+                      f"col {parts['collapse']:.4f} "
                       f"{time.time() - started:.1f}s", flush=True)
 
             if config.eval_every and step % config.eval_every == 0:
-                cos = evaluate_cosine(peft_model, tokenizer, reader, texts, val_idx,
-                                      stats, head, config.taps, device, config.batch_tokens)
-                print(f"  验证 step {step} 逐 token 余弦 {cos:.5f}", flush=True)
-                result.history.append({"step": step, "val_cosine": cos})
-                if cos > best:
-                    best = cos
+                cka = evaluate_cka(peft_model, tokenizer, reader, texts, val_idx,
+                                   config.taps, device, config.batch_tokens, id_cache)
+                print(f"  验证 step {step} 线性 CKA {cka:.5f}", flush=True)
+                result.history.append({"step": step, "val_cka": cka})
+                if cka > best:
+                    best = cka
                     peft_model.save_pretrained(str(out_dir / "lora_best"))
-                    torch.save(
-                        {"head": head.detach().cpu(),
-                         "mean_in": stats["mean_in"].cpu(),
-                         "std_in": stats["std_in"].cpu(),
-                         "mean_out": stats["mean_out"].cpu(),
-                         "std_out": stats["std_out"].cpu(),
-                         "val_cosine": cos},
-                        out_dir / "head_best.pt",
-                    )
-                    print(f"  最优更新 -> {cos:.5f}", flush=True)
+                    print(f"  最优更新 -> {cka:.5f}", flush=True)
 
             if config.save_every and step % config.save_every == 0:
-                save_checkpoint(peft_model, head, opt, sched, step, out_dir)
+                save_checkpoint(peft_model, opt, sched, step, out_dir)
 
     result.steps = step
     peft_model.save_pretrained(str(out_dir / "lora"))
-    torch.save(
-        {
-            "head": head.detach().cpu(),
-            "mean_in": stats["mean_in"].cpu(),
-            "std_in": stats["std_in"].cpu(),
-            "mean_out": stats["mean_out"].cpu(),
-            "std_out": stats["std_out"].cpu(),
-        },
-        out_dir / "head.pt",
-    )
     if skipped:
         print(f"跳过 {skipped} 批（分词长度与特征行数对不上）", flush=True)
     print(f"完成 {step} 步，用时 {time.time() - started:.1f}s -> {out_dir}", flush=True)
@@ -489,29 +507,17 @@ def self_check(
     tokenizer,
     texts: list[str],
     teachers: list[np.ndarray],
-    adapter_path: Path,
     config: FinetuneConfig,
     device: str | torch.device = "cuda",
 ) -> dict[str, float]:
-    """训练前自检：LoRA 零初始化与损失实现是否真的等价喵。
+    """训练前自检喵。
 
-    输入: 未挂 LoRA 的主干、分词器、样本、教师特征、Ridge 解、配置
-    输出: 含 `lora_max_diff`、`cka`、`cos_loss` 的字典
-    预期:
-        - `lora_max_diff` 必须为 0.0：挂 LoRA 后 6 抽头拼接输出与原始模型逐位相同；
-        - `cos_loss` 与 `cka` 应与训练日志 step 1 一致，因为那一步用的就是
-          这组初始参数（LoRA 的 B 为零、head 为 Ridge 解）喵。
+    输入: 未挂 LoRA 的主干、分词器、样本、教师特征、配置
+    输出: 含 `lora_max_diff`、`cka`、`cka_numpy` 的字典
+    预期: `lora_max_diff` 为 0.0（LoRA 零初始化不改变输出），
+          且训练路径的 CKA 与 numpy 独立实现相差小于 1e-4
     """
     device = torch.device(device)
-    adapter = load_file(str(adapter_path))
-    stats = {
-        "mean_in": adapter["mean_in"].to(device, torch.float32),
-        "std_in": adapter["std_in"].to(device, torch.float32),
-        "mean_out": adapter["mean_out"].to(device, torch.float32),
-        "std_out": adapter["std_out"].to(device, torch.float32),
-    }
-    head = adapter["weight"].to(device, torch.float32)
-
     input_ids, mask, kept = make_batch(tokenizer, texts, teachers)
     input_ids = input_ids.to(device)
     mask = mask.to(device)
@@ -533,77 +539,29 @@ def self_check(
     teacher_flat = torch.cat(
         [t[: int(n)] for t, n in zip(kept, mask.sum(1).tolist())], dim=0
     )
-    _, parts = distill_loss(hidden, teacher_flat, head, stats, config)
-    parts["lora_max_diff"] = max_diff
-    parts["trainable"] = float(trainable)
-    parts["total"] = float(total)
-    return parts
 
-
-@torch.inference_mode()
-def reference_numbers(
-    model,
-    tokenizer,
-    texts: list[str],
-    teachers: list[np.ndarray],
-    adapter_path: Path,
-    config: FinetuneConfig,
-    device: str | torch.device = "cuda",
-) -> dict[str, float]:
-    """用不经过训练循环的路径复算 cos 与 CKA，作独立对照喵。
-
-    输入: 未挂 LoRA 的主干、样本、教师特征、Ridge 解、配置
-    输出: `{"cos_loss": ..., "cka": ...}`
-    预期: 与 `self_check` 对应值差在 1e-4 以内；对不上说明批次对齐
-          或标准化口径不一致喵。
-
-    Notes:
-        cos 用 `F.cosine_similarity` 手算，CKA 用 numpy 按定义重写一遍，
-        不复用 `cka.py`，两边同时错的可能性很低喵。
-    """
-    device = torch.device(device)
-    adapter = load_file(str(adapter_path))
-    stats = {
-        "mean_in": adapter["mean_in"].to(device, torch.float32),
-        "std_in": adapter["std_in"].to(device, torch.float32),
-        "mean_out": adapter["mean_out"].to(device, torch.float32),
-        "std_out": adapter["std_out"].to(device, torch.float32),
-    }
-    head = adapter["weight"].to(device, torch.float32)
-
-    input_ids, mask, kept = make_batch(tokenizer, texts, teachers)
-    input_ids = input_ids.to(device)
-    mask = mask.to(device)
-    kept = [t.to(device) for t in kept]
-
-    out = model(input_ids=input_ids, attention_mask=mask,
-                use_cache=False, output_hidden_states=True)
-    h = torch.cat([out.hidden_states[t] for t in config.taps], dim=-1).float()[mask.bool()]
-    t = torch.cat([x[: int(n)] for x, n in zip(kept, mask.sum(1).tolist())], dim=0)
-
-    h_std = (h - stats["mean_in"]) / stats["std_in"]
-    t_std = (t - stats["mean_out"]) / stats["std_out"]
-    pred = h_std @ head * stats["std_out"] + stats["mean_out"]
-
-    cos = torch.nn.functional.cosine_similarity(pred, t, dim=-1)
-    cos_loss = float(1.0 - cos.mean())
-
-    xs = h_std.detach().cpu().numpy().astype(np.float64)
-    ys = t_std.detach().cpu().numpy().astype(np.float64)
+    xs = hidden.detach().cpu().numpy().astype(np.float64)
+    ys = teacher_flat.detach().cpu().numpy().astype(np.float64)
     xs = xs - xs.mean(axis=0, keepdims=True)
     ys = ys - ys.mean(axis=0, keepdims=True)
     cross = np.linalg.norm(ys.T @ xs, "fro")
     den = np.sqrt(np.linalg.norm(xs.T @ xs, "fro") * np.linalg.norm(ys.T @ ys, "fro"))
-    return {"cos_loss": cos_loss, "cka": float(1.0 - cross / den)}
+    cka_numpy = float((cross / den) ** 2)
+
+    _, parts = distill_loss(hidden, teacher_flat, config)
+    parts["lora_max_diff"] = max_diff
+    parts["trainable"] = float(trainable)
+    parts["total"] = float(total)
+    parts["cka_numpy"] = cka_numpy
+    return parts
 
 
-def save_checkpoint(peft_model, head, opt, sched, step: int, out_dir: Path) -> None:
-    """存一份断点，含 LoRA、线性头、优化器与调度器状态喵。"""
+def save_checkpoint(peft_model, opt, sched, step: int, out_dir: Path) -> None:
+    """存一份断点，含 LoRA、优化器与调度器状态喵。"""
     path = out_dir / f"checkpoint_step_{step:06d}.pt"
     torch.save(
         {
             "step": step,
-            "head": head.detach().cpu(),
             "optimizer": opt.state_dict(),
             "scheduler": sched.state_dict(),
         },
@@ -654,7 +612,6 @@ def merge_and_save(peft_model, out_dir: Path, student_dir: Path | None = None) -
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="微调 0.8B 主干的训练循环喵")
     parser.add_argument("--features", type=Path, required=True, help="特征目录（含 meta.json）")
-    parser.add_argument("--adapter", type=Path, required=True, help="Ridge 解，作线性头初值")
     parser.add_argument("--student", type=Path, default=Path("models/qwen3.5-0.8b"))
     parser.add_argument("--tokenizer", type=Path, default=Path("models/tokenizer/tokenizer.json"))
     parser.add_argument("--prompts", type=Path, default=None,
@@ -682,6 +639,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="合并哪个子目录的 LoRA（默认 lora；验证最优点在 lora_best）")
     parser.add_argument("--check", action="store_true",
                         help="只做训练前自检：LoRA 零初始化 + 两条独立路径复算损失喵")
+    parser.add_argument("--ids-cache", type=Path, default=None,
+                        help="可选：预分词缓存 npz 路径；给出时缺文件则先建，之后训练不再分词")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args(argv)
 
@@ -735,6 +694,15 @@ def main(argv: list[str] | None = None) -> int:
     enc = StudentEncoder(args.student, device=args.device, dtype=torch.bfloat16)
     tokenizer = MossTokenizer.from_file(args.tokenizer)
 
+    id_cache = None
+    if args.ids_cache is not None:
+        if args.ids_cache.is_file():
+            id_cache = IdCache.load(args.ids_cache)
+            print(f"预分词缓存命中 {args.ids_cache}", flush=True)
+        else:
+            id_cache = IdCache.build(tokenizer, texts, args.ids_cache)
+            print(f"预分词缓存建好 {args.ids_cache}（{int(id_cache._offsets[-1]):,} token）", flush=True)
+
     config = FinetuneConfig(
         taps=taps,
         steps=steps,
@@ -756,27 +724,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.check:
         pick = (val_idx or train_idx)[:16]
         teachers = reader.read(pick)
-        ref = reference_numbers(
-            enc.model, tokenizer, [texts[i] for i in pick], teachers,
-            args.adapter, config, args.device
-        )
         chk = self_check(
             enc.model, tokenizer, [texts[i] for i in pick], teachers,
-            args.adapter, config, args.device
+            config, args.device
         )
-        print(f"独立复算   cos_loss {ref['cos_loss']:.6f}   cka {ref['cka']:.6f}", flush=True)
-        print(f"训练路径   cos_loss {chk['cos_loss']:.6f}   cka {chk['cka']:.6f}", flush=True)
+        print(f"训练路径 cka {chk['cka']:.6f}   numpy 复算 {chk['cka_numpy']:.6f}", flush=True)
         print(f"LoRA 零初始化最大差 {chk['lora_max_diff']:.3e}   "
               f"可训练 {int(chk['trainable']):,} / {int(chk['total']):,}", flush=True)
-        d_cos = abs(ref["cos_loss"] - chk["cos_loss"])
-        d_cka = abs(ref["cka"] - chk["cka"])
-        ok = chk["lora_max_diff"] == 0.0 and d_cos < 1e-4 and d_cka < 1e-4
-        print(f"自检{'通过' if ok else '失败'}  cos 差 {d_cos:.2e}  cka 差 {d_cka:.2e}", flush=True)
+        d_cka = abs(chk["cka"] - chk["cka_numpy"])
+        ok = chk["lora_max_diff"] == 0.0 and d_cka < 1e-4
+        print(f"自检{'通过' if ok else '失败'}  cka 差 {d_cka:.2e}", flush=True)
         reader.close()
         return 0 if ok else 1
     result = train_finetune(
         enc.model, tokenizer, reader, texts, train_idx, val_idx,
-        args.adapter, config, args.out, args.device
+        config, args.out, args.device, id_cache
     )
     reader.close()
 
