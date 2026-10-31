@@ -93,7 +93,7 @@ New-Item -ItemType Junction `
 
 | 目标目录 | 放置内容 |
 |---|---|
-| `ComfyUI/models/text_encoders/` | Qwen3.5 学生权重：量化版（int8 / w4a8）直接下本仓库的 `weights/`；bf16 用官方原版 |
+| `ComfyUI/models/text_encoders/` | Qwen3.5 学生权重：量化版（int8 / w4a8）取 HF 仓库的 `weights/`；bf16 用官方原版 |
 | `ComfyUI/models/moss_encoder_adapters/` | 对应规格的投影适配器 `.safetensors` 文件 |
 
 官方权重来源：
