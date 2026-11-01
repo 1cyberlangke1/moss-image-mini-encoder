@@ -82,6 +82,7 @@ class FinetuneConfig:
     pad_tiers: tuple[int, ...] | None = None
     vram_warmup: bool = True
     cache_clear_on_checkpoint: bool = False
+    empty_cache_on_save: bool = False
     eval_every: int = 0
     cka_weight: float = 1.0
     cka_bf16: bool = True
@@ -829,15 +830,24 @@ def train_finetune(
               f"{vram_total / 2**30:.2f} GiB，长档批短时溢出喵（告警喵）", flush=True)
 
     def _clear_cache_if_overflowed(step: int) -> None:
-        """本检查点区间内出现过溢出时，归还池中空闲块喵（可选功能喵）。"""
+        """检查点保存时清理空闲块喵。
+
+        输入：step 为当前步数喵；读 config.cache_clear_on_checkpoint、
+        config.empty_cache_on_save 与溢出旗标喵。
+        输出：无返回值喵，只在命中条件时调用 torch.cuda.empty_cache 并打印
+        清理前后的 reserved 与释放量喵。
+        预期行为：溢出触发优先；新开关打开时无视溢出旗标无条件清理喵。
+        """
         nonlocal overflow_since_checkpoint
-        if not config.cache_clear_on_checkpoint or not overflow_since_checkpoint:
+        by_overflow = config.cache_clear_on_checkpoint and overflow_since_checkpoint
+        if not by_overflow and not config.empty_cache_on_save:
             return
         overflow_since_checkpoint = False
         before = torch.cuda.memory_reserved(device) / 2**30
         torch.cuda.empty_cache()
         after = torch.cuda.memory_reserved(device) / 2**30
-        print(f"第 {step} 步 checkpoint：本区间有溢出喵，empty_cache 清理碎片喵，"
+        reason = "本区间有溢出" if by_overflow else "无条件清理"
+        print(f"第 {step} 步 checkpoint：{reason}喵，empty_cache 清理碎片喵，"
               f"resv {before:.2f} -> {after:.2f} GiB 喵，释放 "
               f"{(before - after) * 1024:.0f} MiB 喵", flush=True)
 
@@ -1205,6 +1215,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cache-clear-on-checkpoint", action="store_true",
                         help="存 checkpoint 时若本区间出现过显存溢出告警喵，"
                              "empty_cache 归还池中空闲块喵（可选喵，默认关喵）")
+    parser.add_argument("--empty-cache-on-save", action="store_true",
+                        help="存 checkpoint 时无条件 empty_cache 喵，"
+                             "不看本区间有无溢出喵（可选喵，默认关喵）")
     parser.add_argument("--val-tokens", type=int, default=40000,
                         help="验证集最多用多少 token")
     parser.add_argument("--eval-every", type=int, default=0,
@@ -1321,6 +1334,7 @@ def main(argv: list[str] | None = None) -> int:
         pad_tiers=tiers,
         vram_warmup=args.vram_warmup,
         cache_clear_on_checkpoint=args.cache_clear_on_checkpoint,
+        empty_cache_on_save=args.empty_cache_on_save,
         eval_every=args.eval_every,
         lora_r=args.lora_r,
         lr_lora=args.lr,
