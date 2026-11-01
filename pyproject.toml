@@ -9,7 +9,7 @@ description = "用 Qwen3.5-0.8B 加逐 token 投影替换 MOSS-Image 的 Qwen3.5
 readme = "README.md"
 requires-python = ">=3.11"
 
-# 只跑数据构建（不跑编码/训练）时的最小依赖；torch 那套见 requirements.txt
+# 只跑数据构建（不跑编码/训练）时的最小依赖；torch 那套见 src/requirements.txt
 dependencies = [
     "numpy>=2.0",
     "pyyaml>=6.0",
@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# 编码与训练额外需要的东西。版本以 requirements.txt 的钉死值为准。
+# 编码与训练额外需要的东西。版本以 src/requirements.txt 的钉死值为准。
 train = [
     "torch>=2.7",
     "transformers>=5.21",

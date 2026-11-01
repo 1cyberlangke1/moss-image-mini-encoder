@@ -74,18 +74,14 @@ MOSS-Image 官方默认的 9B 文本编码器体积较大，在消费级显卡�
 
 ### 1. 安装自定义节点
 
-节点在仓库的 `src/comfyui_node`，把**这一层**放进 `custom_nodes`，不是整个仓库。
+把整个仓库放进 `ComfyUI/custom_nodes/` 下，重启 ComfyUI 即可：
 
 ```powershell
-# Windows：建目录链接，改仓库代码后不用重拷
-New-Item -ItemType Junction `
-  -Path "C:\Users\<你>\Documents\ComfyUI\custom_nodes\moss-08b-adapter" `
-  -Target "D:\path\to\moss-image-mini-encoder\src\comfyui_node"
+git clone https://github.com/1cyberlangke1/moss-image-mini-encoder `
+  "C:\Users\<你>\Documents\ComfyUI\custom_nodes\moss-image-mini-encoder"
 ```
 
-也可以直接把 `src/comfyui_node` 复制成 `ComfyUI/custom_nodes/moss-08b-adapter`。
-
-整仓放进 `custom_nodes` 会报 `FileNotFoundError: ...\moss-image-mini-encoder\__init__.py`，节点不会注册。
+节点实现位于 `src/comfyui_node/`，仓库根的 `__init__.py` 负责把它接进 ComfyUI 喵。
 
 ### 2. 放置模型与适配器文件
 

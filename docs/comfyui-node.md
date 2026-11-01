@@ -12,17 +12,14 @@ MossCLIPLoader(学生权重, type="moss_image", adapter) ──> CLIP ──> CL
 
 ## 安装说明
 
-把仓库的 `src/comfyui_node` 放进 `custom_nodes`（放**这一层**，不是整个仓库）：
+把整个仓库放进 `custom_nodes`，重启 ComfyUI：
 
 ```powershell
-New-Item -ItemType Junction `
-  -Path "C:\Users\<你>\Documents\ComfyUI\custom_nodes\moss-08b-adapter" `
-  -Target "D:\path\to\moss-image-mini-encoder\src\comfyui_node"
+git clone https://github.com/1cyberlangke1/moss-image-mini-encoder `
+  "C:\Users\<你>\Documents\ComfyUI\custom_nodes\moss-image-mini-encoder"
 ```
 
-或直接复制 `src/comfyui_node` 成 `custom_nodes/moss-08b-adapter`，然后重启 ComfyUI。
-
-整仓放进 `custom_nodes` 会报 `FileNotFoundError: ...\moss-image-mini-encoder\__init__.py`，节点不会注册。
+节点实现位于 `src/comfyui_node/`，仓库根的 `__init__.py` 负责把它接进 ComfyUI 喵。
 
 ### 模型与文件放置路径
 
