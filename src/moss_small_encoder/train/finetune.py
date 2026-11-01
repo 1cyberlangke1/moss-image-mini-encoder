@@ -81,6 +81,7 @@ class FinetuneConfig:
     packed: bool = False
     pad_tiers: tuple[int, ...] | None = None
     vram_warmup: bool = True
+    cache_clear_on_checkpoint: bool = False
     eval_every: int = 0
     cka_weight: float = 1.0
     cka_bf16: bool = True
@@ -827,8 +828,22 @@ def train_finetune(
             return
         # 只告警不停喵：超档位批（语料最长 3235 喵，仅 22 条喵）物理装不下喵，
         # 允许其短时溢出喵，短档批页会被 WDDM 迁回喵，速度局部受影响喵
+        nonlocal overflow_since_checkpoint
+        overflow_since_checkpoint = True
         print(f"第 {step} 步 resv {resv / 2**30:.2f} GiB 超过物理显存 "
               f"{vram_total / 2**30:.2f} GiB，长档批短时溢出喵（告警喵）", flush=True)
+
+    def _clear_cache_if_overflowed(step: int) -> None:
+        """本检查点区间内出现过溢出时，归还池中空闲块喵（可选功能喵）。"""
+        nonlocal overflow_since_checkpoint
+        if not config.cache_clear_on_checkpoint or not overflow_since_checkpoint:
+            return
+        overflow_since_checkpoint = False
+        before = torch.cuda.memory_reserved(device) / 2**30
+        torch.cuda.empty_cache()
+        after = torch.cuda.memory_reserved(device) / 2**30
+        print(f"第 {step} 步 checkpoint：本区间有溢出喵，empty_cache "
+              f"{before:.2f} -> {after:.2f} GiB 喵", flush=True)
 
     def report(tag: str) -> None:
         """打印当前显存 top10 活跃块及其分配调用栈喵。"""
@@ -900,6 +915,7 @@ def train_finetune(
     peft_model.train()
     started = time.time()
     last_log_t, last_log_step = started, start_step
+    overflow_since_checkpoint = False
     best = -1.0
     step = start_step
     skipped = 0
@@ -1021,6 +1037,7 @@ def train_finetune(
                     print(f"  最优更新 -> {cka:.5f}", flush=True)
 
             if config.save_every and step % config.save_every == 0:
+                _clear_cache_if_overflowed(step)
                 save_checkpoint(peft_model, opt, sched, step, out_dir, config.keep_last)
 
     result.steps = step
@@ -1189,6 +1206,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--vram-warmup", action="store_false", dest="vram_warmup",
                         help="关闭显存池预热（默认开启喵）：预热的假前向反向不更新"
                              "优化器与学习率，与学习率 warmup 是两回事喵")
+    parser.add_argument("--cache-clear-on-checkpoint", action="store_true",
+                        help="存 checkpoint 时若本区间出现过显存溢出告警喵，"
+                             "empty_cache 归还池中空闲块喵（可选喵，默认关喵）")
     parser.add_argument("--val-tokens", type=int, default=40000,
                         help="验证集最多用多少 token")
     parser.add_argument("--eval-every", type=int, default=0,
@@ -1304,6 +1324,7 @@ def main(argv: list[str] | None = None) -> int:
         packed=args.packed,
         pad_tiers=tiers,
         vram_warmup=args.vram_warmup,
+        cache_clear_on_checkpoint=args.cache_clear_on_checkpoint,
         eval_every=args.eval_every,
         lora_r=args.lora_r,
         lr_lora=args.lr,
