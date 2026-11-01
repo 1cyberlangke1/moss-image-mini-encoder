@@ -815,6 +815,10 @@ def train_finetune(
         path.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
         print(f"显存快照已写 {path.name}（{len(out)} 块）喵", flush=True)
 
+    # 不开历史记录时快照没有调用栈（frames 全空喵）；只在越界 dump 前临时开启喵
+    # 训练开始即记录喵：需要覆盖从第一步起的分配喵
+    torch.cuda.memory._record_memory_history(max_entries=65536, stack_depth=4)
+
     def _check_vram(step: int) -> None:
         resv = torch.cuda.memory_reserved(device)
         if resv <= vram_total:
