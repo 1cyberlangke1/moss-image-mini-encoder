@@ -990,8 +990,8 @@ def train_finetune(
                 teacher_flat = torch.cat([item.to(device) for item in kept], dim=0)
             else:
                 input_ids, mask, kept = prepared
-                input_ids = input_ids.to(device, non_blocking=True)
-                mask = mask.to(device, non_blocking=True)
+                input_ids = input_ids.to(device)
+                mask = mask.to(device)
 
                 def run_forward():
                     """补齐前向：抽头交给 hook 收集喵。"""
@@ -1016,7 +1016,7 @@ def train_finetune(
                 hidden = hidden_full.reshape(-1, hidden_full.shape[1])[index]
                 teacher_flat = torch.cat(
                     [t[:n] for t, n in zip(kept, lengths)], dim=0
-                ).to(device, non_blocking=True)
+                ).to(device)
 
             # 损失必须在 autocast 之外算：CKA 走 float32，余弦要稳定喵
             loss, parts = distill_loss(hidden, teacher_flat, config)
