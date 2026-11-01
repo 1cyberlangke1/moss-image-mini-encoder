@@ -837,8 +837,10 @@ def train_finetune(
         before = torch.cuda.memory_reserved(device) / 2**30
         torch.cuda.empty_cache()
         after = torch.cuda.memory_reserved(device) / 2**30
-        print(f"第 {step} 步 checkpoint：本区间有溢出喵，empty_cache "
-              f"{before:.2f} -> {after:.2f} GiB 喵", flush=True)
+        print(f"第 {step} 步 checkpoint：本区间有溢出喵，empty_cache 清理碎片喵，"
+              f"resv {before:.2f} -> {after:.2f} GiB 喵，释放 "
+              f"{(before - after) * 1024:.0f} MiB 喵，池中空闲块已归还驱动喵，"
+              f"后续批将重新分配喵，速度应回升喵", flush=True)
 
     def report(tag: str) -> None:
         """打印当前显存 top10 活跃块及其分配调用栈喵。"""
