@@ -796,6 +796,49 @@ def train_finetune(
     peft_model, trainable, total = build_lora(model, config)
     print(f"LoRA 可训练 {trainable:,} / 总 {total:,} = {trainable / total:.3%}", flush=True)
 
+    # 物理显存上限：reserved 是 PyTorch 自己申请的总量喵，越过它说明 WDDM
+    # 正在把超出的部分塞进共享显存（无声掉速的根源）喵，触发即自杀喵
+    vram_total = torch.cuda.get_device_properties(device).total_memory
+
+    def _snapshot_dump(path: Path) -> None:
+        """把每个活跃分配块的调用栈写进 json，显存账单喵。"""
+        snap = torch.cuda.memory_snapshot()
+        out = []
+        for seg in snap:
+            for b in seg.get("blocks", []):
+                if b["state"] != "active_allocated":
+                    continue
+                frames = [f.get("filename", "") + ":" + str(f.get("line", "")) + " " + f.get("name", "")
+                          for f in (b.get("frames") or [])[:4]]
+                out.append({"size": b["size"], "frames": frames})
+        out.sort(key=lambda item: -item["size"])
+        path.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+        print(f"显存快照已写 {path.name}（{len(out)} 块）喵", flush=True)
+
+    def _check_vram(step: int) -> None:
+        resv = torch.cuda.memory_reserved(device)
+        if resv <= vram_total:
+            return
+        print(f"第 {step} 步 resv {resv / 2**30:.2f} GiB 超过物理显存 "
+              f"{vram_total / 2**30:.2f} GiB，已溢出到共享显存，立即停止喵", flush=True)
+        report("over-vram")
+        _snapshot_dump(out_dir / "mem_snapshot.json")
+        raise SystemExit(1)
+
+    def report(tag: str) -> None:
+        """打印当前显存 top10 活跃块及其分配调用栈喵。"""
+        snap = torch.cuda.memory_snapshot()
+        blocks = []
+        for seg in snap:
+            for b in seg.get("blocks", []):
+                if b["state"] == "active_allocated":
+                    frames = [f.get("name", "") for f in (b.get("frames") or [])[:2]]
+                    blocks.append((b["size"], frames))
+        blocks.sort(key=lambda item: -item[0])
+        top = " | ".join(f"{s / 2**20:.0f}M@{frames[0] if frames else '?'}" for s, frames in blocks[:10])
+        print(f"[{tag}] alloc {torch.cuda.memory_allocated(device) / 2**30:.2f} "
+              f"resv {torch.cuda.memory_reserved(device) / 2**30:.2f} top[{top}]", flush=True)
+
     params = [p for p in peft_model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW([{"params": params, "lr": config.lr_lora, "weight_decay": 0.0}])
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -929,6 +972,9 @@ def train_finetune(
                       f"{sec_per_step:.2f}s/step "
                       f"alloc {torch.cuda.memory_allocated() / 2**30:.2f} "
                       f"resv {torch.cuda.memory_reserved() / 2**30:.2f}", flush=True)
+                _check_vram(step)
+                if step % (config.log_every * 10) == 0 or step == config.log_every:
+                    report(f"step {step}")
                 last_log_t, last_log_step = now, step
 
             if config.eval_every and step % config.eval_every == 0:
