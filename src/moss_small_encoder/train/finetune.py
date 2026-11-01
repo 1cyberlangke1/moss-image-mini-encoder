@@ -290,15 +290,18 @@ def make_batch(
         seqs.append(torch.tensor(ids[1:], dtype=torch.long))
         # 保持 fp16 上卡：CPU 上转 fp32 要多花一趟约 67 MB 的转换，
         # 而且 PCIe 传输量翻倍；fp32 提升留到 GPU 上做，几乎不花时间喵
-        kept_teachers.append(torch.from_numpy(teacher[1:]))
+        kept_teachers.append(torch.from_numpy(teacher[1:]).pin_memory())
     if not seqs:
         raise RuntimeError("没有一条样本的 token 数与特征对齐喵")
 
     max_len = max(int(s.shape[0]) for s in seqs)
     if pad_to > max_len:
         max_len = pad_to
-    input_ids = torch.full((len(seqs), max_len), PAD_ID, dtype=torch.long)
-    mask = torch.zeros((len(seqs), max_len), dtype=torch.long)
+    # 锁页内存交给显卡直接读，上卡才能异步喵
+    input_ids = torch.full(
+        (len(seqs), max_len), PAD_ID, dtype=torch.long, pin_memory=True
+    )
+    mask = torch.zeros((len(seqs), max_len), dtype=torch.long, pin_memory=True)
     for i, seq in enumerate(seqs):
         input_ids[i, : seq.shape[0]] = seq
         mask[i, : seq.shape[0]] = 1
@@ -987,8 +990,8 @@ def train_finetune(
                 teacher_flat = torch.cat([item.to(device) for item in kept], dim=0)
             else:
                 input_ids, mask, kept = prepared
-                input_ids = input_ids.to(device)
-                mask = mask.to(device)
+                input_ids = input_ids.to(device, non_blocking=True)
+                mask = mask.to(device, non_blocking=True)
 
                 def run_forward():
                     """补齐前向：抽头交给 hook 收集喵。"""
@@ -1001,10 +1004,19 @@ def train_finetune(
                         decoder_layers(peft_model), config.taps, run_forward
                     )
                     hidden_full = torch.cat(taps_out, dim=-1).float()
-                hidden = hidden_full[mask.bool()]
+                lengths = [int(n) for n in mask.sum(1).tolist()]
+                # 右 padding：按行长度直接拼索引，省掉布尔掩码的 nonzero 扫描喵
+                index = torch.cat(
+                    [
+                        torch.arange(n, device=hidden_full.device)
+                        + i * hidden_full.shape[1]
+                        for i, n in enumerate(lengths)
+                    ]
+                )
+                hidden = hidden_full.reshape(-1, hidden_full.shape[1])[index]
                 teacher_flat = torch.cat(
-                    [t[: int(n)] for t, n in zip(kept, mask.sum(1).tolist())], dim=0
-                ).to(device)
+                    [t[:n] for t, n in zip(kept, lengths)], dim=0
+                ).to(device, non_blocking=True)
 
             # 损失必须在 autocast 之外算：CKA 走 float32，余弦要稳定喵
             loss, parts = distill_loss(hidden, teacher_flat, config)
