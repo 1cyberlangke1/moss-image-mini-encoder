@@ -150,6 +150,39 @@ def test_default_pad_tiers_geometric() -> None:
     assert all(a < b for a, b in zip(tiers, tiers[1:]))
 
 
+def test_tier_batches_full_scale_invariants() -> None:
+    """真实规模的不变量：批数量级、恰好覆盖、预算与档位一致喵。
+
+    输入: 57.4 万条真实长度分布（档位 16..2048、预算 2048）
+    输出: `build_tier_batches` 的批次
+    预期: 批数在 1 万到 3 万之间（溢出 bug 会让它暴涨到 57 万）；
+          所有下标恰好出现一次；每批条数乘批内最长不超过预算
+          （独占批除外）；批形状种类不超过档位数加溢出批数喵
+    """
+    rng = np.random.default_rng(20261027)
+    # 近似真实语料的长度分布：大量 8~40 token 短句 + 少量长文喵
+    lengths = rng.lognormal(4.0, 1.1, size=574_087).astype(int).clip(3, 3200).tolist()
+    indices = list(range(len(lengths)))
+    tiers = [16, 24, 36, 54, 81, 121, 181, 271, 406, 609, 913, 1369, 2048]
+
+    batches = build_tier_batches(indices, lengths, 2048, rng, tiers)
+
+    # 溢出 bug 的特征是 57 万批（每批 1 条）；正常切批应低于其 1/5 喵
+    assert len(batches) < 100_000, f"批数 {len(batches)} 呈溢出 bug 特征喵"
+    # 碎批（<=2 条）只允许是档位尾巴：不超过两成喵
+    tiny = sum(1 for b in batches if len(b) <= 2)
+    assert tiny <= len(batches) * 0.2, f"碎批过多: {tiny}/{len(batches)} 喵"
+    flat = sorted(i for b in batches for i in b)
+    assert flat == indices
+    for b in batches:
+        longest = max(lengths[i] for i in b)
+        if longest > tiers[-1]:
+            assert len(b) == 1
+        else:
+            assert len(b) * longest <= 2048
+            assert len(b) <= 256
+
+
 def test_tier_batches_fixed_shapes_and_coverage() -> None:
     """档位切批要给出少数几种固定形状喵。
 

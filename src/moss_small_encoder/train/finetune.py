@@ -549,6 +549,12 @@ def build_tier_batches(
     """
     tier_B = [max(1, budget // t) for t in tiers]
     slots: list[list[int]] = [[] for _ in tiers]
+    # 每个档位记录「当前正在填的槽下标」：溢出后新槽继续接收样本，
+    # 否则判断条件永远量第一个槽、第一批满了之后全部一条一批喵
+    cur = list(range(len(tiers)))
+    # 每个当前槽内已见的最短长度：同档内长短混装会把补齐预算提前耗尽，
+    # 批碎成两三条喵；按教师侧 make_batches 的口径卡最长/最短比喵
+    slot_min: list[int] = [0] * len(tiers)
     for idx in sorted(indices, key=lambda i: int(lengths[i])):
         n = int(lengths[idx])
         # 超过最大档位的样本独占一批，B=1，形状单独一种（数据里极少）
@@ -556,13 +562,23 @@ def build_tier_batches(
             slots.append([idx])
             tier_B.append(1)
             continue
-        t = min(t for t in tiers if t >= n)
-        k = tier_B[tiers.index(t)]
-        if len(slots[tiers.index(t)]) + 1 > min(max_prompts, k):
+        ti = next(i for i, t in enumerate(tiers) if t >= n)
+        k = tier_B[ti]
+        s = slots[cur[ti]]
+        # 长度比：槽里已有最短样本的 max_aspect 倍装不下这条，提前关批喵
+        aspect_full = s and slot_min[ti] and n > slot_min[ti] * 3.0
+        if s and (aspect_full
+                  or (len(s) + 1) * tiers[ti] > budget
+                  or len(s) + 1 > min(max_prompts, k)):
             slots.append([idx])
             tier_B.append(k)
+            cur[ti] = len(slots) - 1
+            slot_min[ti] = n
+        elif not s:
+            slots[cur[ti]].append(idx)
+            slot_min[ti] = n
         else:
-            slots[tiers.index(t)].append(idx)
+            slots[cur[ti]].append(idx)
 
     # 档位之间打乱，避免相邻步的形状与长度单调；空档位剔除喵
     order = rng.permutation(len(slots))
@@ -795,7 +811,8 @@ def train_finetune(
         from peft import PeftModel
 
         peft_model = PeftModel.from_pretrained(
-            model, str(lora_dir), is_trainable=True
+            model, str(lora_dir), is_trainable=True,
+            adapter_name="default",
         )
         peft_model.to(device)
         opt.load_state_dict(payload["optimizer"])
