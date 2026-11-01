@@ -80,6 +80,7 @@ class FinetuneConfig:
     batch_tokens: int = 4096
     packed: bool = False
     pad_tiers: tuple[int, ...] | None = None
+    vram_warmup: bool = True
     eval_every: int = 0
     cka_weight: float = 1.0
     cka_bf16: bool = True
@@ -867,12 +868,14 @@ def train_finetune(
         sched.load_state_dict(payload["scheduler"])
         print(f"从 {resume.name} 恢复到第 {start_step} 步（LoRA 来自 {lora_dir.name}）", flush=True)
 
-    # 池子预扩：用每个档位的**真实形状**（B=budget//tier，T=tier）各跑一次
-    # 假前向假反向喵，缓存池一次性建到覆盖全部形状的最大形态喵。数据序喵、
-    # 步数喵、优化器状态喵全部不动喵，loss 丢弃喵
-    if not config.packed and config.pad_tiers:
+    # 池子预扩（显存预热喵，与学习率 warmup 无关喵）：用每个档位的**真实形状**
+    # （B=budget//tier，T=tier）各跑一次假前向假反向喵，缓存池一次性建到
+    # 覆盖全部形状的最大形态喵。数据序喵、步数喵、优化器状态喵全部不动喵，
+    # loss 丢弃喵，学习率不受影响喵（不调用 sched.step 喵）
+    if config.vram_warmup and not config.packed and config.pad_tiers:
         peft_model.train()
-        for tier in sorted(config.pad_tiers):
+        warm_tiers = sorted(set(config.pad_tiers) | {max(reader.lengths)})
+        for tier in warm_tiers:
             b = max(1, config.batch_tokens // tier)
             input_ids = torch.full((b, tier), PAD_ID, dtype=torch.long)
             mask = torch.zeros((b, tier), dtype=torch.long)
@@ -1184,6 +1187,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pad-tiers", default=None,
                         help="档位切批的固定长度档，逗号分隔（如 128,256,512,1024,2048）；"
                              "默认按 batch-tokens 自动生成几何档喵")
+    parser.add_argument("--vram-warmup", action="store_false", dest="vram_warmup",
+                        help="关闭显存池预热（默认开启喵）：预热的假前向反向不更新"
+                             "优化器与学习率，与学习率 warmup 是两回事喵")
     parser.add_argument("--val-tokens", type=int, default=40000,
                         help="验证集最多用多少 token")
     parser.add_argument("--eval-every", type=int, default=0,
@@ -1298,6 +1304,7 @@ def main(argv: list[str] | None = None) -> int:
         batch_tokens=args.batch_tokens,
         packed=args.packed,
         pad_tiers=tiers,
+        vram_warmup=args.vram_warmup,
         eval_every=args.eval_every,
         lora_r=args.lora_r,
         lr_lora=args.lr,
