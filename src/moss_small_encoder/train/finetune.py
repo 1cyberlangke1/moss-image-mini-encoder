@@ -793,6 +793,11 @@ def train_finetune(
     torch.manual_seed(config.seed)
     rng = np.random.default_rng(config.seed)
 
+    # 不开历史记录时快照没有调用栈（frames 全空喵）；训练一开始就记录喵
+    # （build_lora 之前喵），上限 1M 条防止被海量小分配刷掉喵
+    torch.cuda.memory._record_memory_history(enabled="all", context="all",
+                                             stacks="all", max_entries=1_000_000)
+
     peft_model, trainable, total = build_lora(model, config)
     print(f"LoRA 可训练 {trainable:,} / 总 {total:,} = {trainable / total:.3%}", flush=True)
 
@@ -814,10 +819,6 @@ def train_finetune(
         out.sort(key=lambda item: -item["size"])
         path.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
         print(f"显存快照已写 {path.name}（{len(out)} 块）喵", flush=True)
-
-    # 不开历史记录时快照没有调用栈（frames 全空喵）；训练开始即记录喵
-    torch.cuda.memory._record_memory_history(enabled="all", context="all",
-                                             stacks="all", max_entries=65536)
 
     def _check_vram(step: int) -> None:
         resv = torch.cuda.memory_reserved(device)
