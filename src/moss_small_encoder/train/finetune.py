@@ -867,28 +867,15 @@ def train_finetune(
         sched.load_state_dict(payload["scheduler"])
         print(f"从 {resume.name} 恢复到第 {start_step} 步（LoRA 来自 {lora_dir.name}）", flush=True)
 
-    # 池子预扩：用每个档位的形状各跑一次假前向假反向喵，缓存池一次性建到
-    # 覆盖全部形状的最大形态喵。数据序喵、步数喵、优化器状态喵全部不动喵，
-    # loss 丢弃喵，唯一的收益是之后任何批都有现成空闲块可复用喵，resv 恒定喵
+    # 池子预扩：用每个档位的**真实形状**（B=budget//tier，T=tier）各跑一次
+    # 假前向假反向喵，缓存池一次性建到覆盖全部形状的最大形态喵。数据序喵、
+    # 步数喵、优化器状态喵全部不动喵，loss 丢弃喵
     if not config.packed and config.pad_tiers:
         peft_model.train()
-        warm_idx = train_idx[: max(8, len(train_idx) // 1000) or 8]
         for tier in sorted(config.pad_tiers):
-            take = warm_idx[: max(1, config.batch_tokens // tier)]
-            n = max(1, config.batch_tokens // tier)
-            take = train_idx[:n]
-            ids_list = None
-            if id_cache is not None:
-                ids_list = [id_cache.get(i) for i in take]
-            seqs = [id_seqs[1:] if id_seqs is not None else tokenizer.encode(texts[i])[1:]
-                    for i, id_seqs in zip(take, ids_list or [None] * len(take))]
-            tmax = min(tier, max(len(s) for s in seqs))
-            input_ids = torch.full((len(seqs), tmax), PAD_ID, dtype=torch.long)
-            mask = torch.zeros((len(seqs), tmax), dtype=torch.long)
-            for ri, seq in enumerate(seqs):
-                ln = min(len(seq), tmax)
-                input_ids[ri, :ln] = torch.tensor(seq[:ln], dtype=torch.long)
-                mask[ri, :ln] = 1
+            b = max(1, config.batch_tokens // tier)
+            input_ids = torch.full((b, tier), PAD_ID, dtype=torch.long)
+            mask = torch.zeros((b, tier), dtype=torch.long)
             input_ids, mask = input_ids.to(device), mask.to(device)
 
             def run_warm():
@@ -903,9 +890,8 @@ def train_finetune(
             loss.backward()
             opt.zero_grad(set_to_none=True)
             del taps_out, hidden_full, hidden, teacher_flat, loss
-        torch.cuda.empty_cache()
-        print(f"池子预扩完成：13 档形状已覆盖喵 resv {torch.cuda.memory_reserved() / 2**30:.2f} GiB",
-              flush=True)
+        print(f"池子预扩完成：{len(config.pad_tiers)} 档形状已覆盖喵 "
+              f"resv {torch.cuda.memory_reserved() / 2**30:.2f} GiB", flush=True)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     result = FinetuneResult(steps=0)
