@@ -825,11 +825,10 @@ def train_finetune(
         resv = torch.cuda.memory_reserved(device)
         if resv <= vram_total:
             return
+        # 只告警不停喵：超档位批（语料最长 3235 喵，仅 22 条喵）物理装不下喵，
+        # 允许其短时溢出喵，短档批页会被 WDDM 迁回喵，速度局部受影响喵
         print(f"第 {step} 步 resv {resv / 2**30:.2f} GiB 超过物理显存 "
-              f"{vram_total / 2**30:.2f} GiB，已溢出到共享显存，立即停止喵", flush=True)
-        report("over-vram")
-        _snapshot_dump(out_dir / "mem_snapshot.json")
-        raise SystemExit(1)
+              f"{vram_total / 2**30:.2f} GiB，长档批短时溢出喵（告警喵）", flush=True)
 
     def report(tag: str) -> None:
         """打印当前显存 top10 活跃块及其分配调用栈喵。"""
@@ -874,7 +873,7 @@ def train_finetune(
     # loss 丢弃喵，学习率不受影响喵（不调用 sched.step 喵）
     if config.vram_warmup and not config.packed and config.pad_tiers:
         peft_model.train()
-        warm_tiers = sorted(set(config.pad_tiers) | {max(reader.lengths)})
+        warm_tiers = sorted(set(config.pad_tiers))
         for tier in warm_tiers:
             b = max(1, config.batch_tokens // tier)
             input_ids = torch.full((b, tier), PAD_ID, dtype=torch.long)
