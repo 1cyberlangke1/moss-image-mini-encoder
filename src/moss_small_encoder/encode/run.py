@@ -19,6 +19,8 @@ import argparse
 import gc
 import hashlib
 import json
+import queue
+import threading
 import time
 from pathlib import Path
 
@@ -669,6 +671,7 @@ def _run_student_pass(
     budget: int,
     max_prompts: int,
     taps: tuple[int, ...],
+    max_aspect: float = 3.0,
     student_dir: Path = STUDENT_DIR,
     quant_path: Path | None = None,
 ) -> float:
@@ -710,7 +713,7 @@ def _run_student_pass(
 
     start = int(resume["done"]) if resume else 0
     remaining = rows[start:]
-    batches = make_batches(remaining, budget, max_prompts)
+    batches = make_batches(remaining, budget, max_prompts, max_aspect=max_aspect)
     total = sum(row["n_tokens"] for row in rows)
     started = time.time()
     student = StudentEncoder(student_dir, device=device, quant_path=quant_path)
@@ -722,9 +725,56 @@ def _run_student_pass(
 
     written = start
     done = int(resume["tokens"]) if resume else 0
+    produced_tokens = done
+    write_queue: queue.Queue = queue.Queue(maxsize=4)
+    errors: list[BaseException] = []
+
+    def _writer_loop(raw_writer: "_RawWriter") -> None:
+        """按提交顺序落盘喵。
+
+        输入: 队列里的 `(序号, 每条样本的数组列表)`，末尾一个 None 表示结束喵。
+        输出: 无返回值喵，累计 written 与 done 并写进度文件喵。
+        预期: 序号必须从 1 连续递增，错乱时抛错而不是继续写喵。
+        """
+        nonlocal written, done
+        expected = 1
+        try:
+            while True:
+                item = write_queue.get()
+                if item is None:
+                    return
+                index, rows_np = item
+                if index != expected:
+                    raise RuntimeError(
+                        f"写盘序号错乱：期望 {expected}，收到 {index} 喵"
+                    )
+                for arr in rows_np:
+                    raw_writer.add(arr)
+                written += len(rows_np)
+                done += sum(int(arr.shape[0]) for arr in rows_np)
+                raw_writer.flush()
+                _write_progress(
+                    progress_path,
+                    {
+                        "done": written,
+                        "tokens": raw_writer.n_tokens,
+                        "bytes": raw_writer.offset,
+                        "total": len(rows),
+                        "fingerprint": fingerprint,
+                        "settings": settings,
+                    },
+                )
+                expected += 1
+        except BaseException as exc:  # noqa: BLE001 - 交给主线程抛出
+            errors.append(exc)
+
     with _RawWriter(
         out_dir / "student.raw", student.hidden_size * len(taps), resume
     ) as writer:
+        writer_thread = threading.Thread(
+            target=_writer_loop, args=(writer,), name="student-writer", daemon=True
+        )
+        writer_thread.start()
         for index, batch in enumerate(batches, 1):
             input_ids, attention_mask, batch_lengths = pad_batch(batch, tokenizer, device)
             with torch.inference_mode():
@@ -733,33 +783,28 @@ def _run_student_pass(
             hidden_np = torch.cat(
                 [hidden[t].to(torch.float16) for t in taps], dim=-1
             ).cpu().numpy()
-            for row_index, length in enumerate(batch_lengths):
-                writer.add(hidden_np[row_index, :length])
-            written += len(batch)
-            done += sum(batch_lengths)
-
-            writer.flush()
-            _write_progress(
-                progress_path,
-                {
-                    "done": written,
-                    "tokens": writer.n_tokens,
-                    "bytes": writer.offset,
-                    "total": len(rows),
-                    "fingerprint": fingerprint,
-                    "settings": settings,
-                },
-            )
+            rows_np = [
+                hidden_np[row_index, :length]
+                for row_index, length in enumerate(batch_lengths)
+            ]
+            produced_tokens += sum(batch_lengths)
+            write_queue.put((index, rows_np))
+            if errors:
+                raise errors[0]
 
             if index % 20 == 0 or index == len(batches):
                 elapsed = time.time() - started
-                rate = (done - (int(resume["tokens"]) if resume else 0)) / elapsed if elapsed else 0
-                eta = (total - done) / rate / 60 if rate > 0 else 0
+                rate = (produced_tokens - (int(resume["tokens"]) if resume else 0)) / elapsed if elapsed else 0
+                eta = (total - produced_tokens) / rate / 60 if rate > 0 else 0
                 print(
-                    f"[student] 批 {index}/{len(batches)}  {done:,}/{total:,} token  "
+                    f"[student] 批 {index}/{len(batches)}  {produced_tokens:,}/{total:,} token  "
                     f"{rate:.0f} token/s  剩余 {eta:.1f} 分",
                     flush=True,
                 )
+        write_queue.put(None)
+        writer_thread.join()
+        if errors:
+            raise errors[0]
 
     del student
     gc.collect()
@@ -849,6 +894,8 @@ def main(argv: list[str] | None = None) -> int:
         help="把整批拼成一条序列做 varlen 前向，不补 padding；需要 flash-attn",
     )
     parser.add_argument("--student-budget", type=int, default=0, help="student 批 token 预算；0 表示按显存自动推断")
+    parser.add_argument("--student-max-aspect", type=float, default=3.0,
+                        help="编码时批内最长/最短长度比上限；编码不吃梯度，放宽可减少批数与固定开销")
     parser.add_argument("--teacher-max-prompts", type=int, default=64, help="teacher 每批最多条数")
     parser.add_argument("--student-max-prompts", type=int, default=256, help="student 每批最多条数")
     parser.add_argument("--limit", type=int, default=None, help="只编码前 N 条")
@@ -945,6 +992,7 @@ def main(argv: list[str] | None = None) -> int:
             student_budget,
             args.student_max_prompts,
             taps,
+            args.student_max_aspect,
             args.student_dir,
             args.student_quant,
         )
