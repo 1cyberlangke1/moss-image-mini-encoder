@@ -23,7 +23,6 @@ import csv
 import hashlib
 import json
 import os
-import random
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -106,7 +105,6 @@ def load_pairs(
     csv_path: Path | str,
     min_post_count: int = 0,
     max_characters: int | None = None,
-    seed: int = 20261027,
 ) -> list[dict]:
     """读对照表并筛出角色条目喵。
 
@@ -114,7 +112,6 @@ def load_pairs(
         csv_path: `tags.csv` 路径。
         min_post_count: 只保留帖子数不低于该值的条目；0 表示不截断。
         max_characters: 最多取多少个角色，None 表示全部。
-        seed: 洗牌种子；先按热度降序取前 N，再用该种子打乱喵。
 
     Returns:
         字典列表，键为 `name` / `cn_name` / `post_count`。
@@ -152,14 +149,12 @@ def load_pairs(
     rows.sort(key=lambda item: item["post_count"], reverse=True)
     if max_characters is not None:
         rows = rows[:max_characters]
-    random.Random(seed).shuffle(rows)
     return rows
 
 
 def iter_records(
     csv_path: Path | str,
     per_character: int = 4,
-    seed: int = 20261027,
     min_post_count: int = 0,
     max_characters: int | None = None,
 ) -> Iterator[CnRecord]:
@@ -168,7 +163,6 @@ def iter_records(
     Args:
         csv_path: 对照表路径。
         per_character: 每个角色产出几条，最多取 `len(TEMPLATES)`。
-        seed: 洗牌与模板轮换种子，固定值保证可复现。
         min_post_count: 热度下限，0 表示不截断。
         max_characters: 最多取多少个角色，None 表示全部。
 
@@ -180,7 +174,7 @@ def iter_records(
         同时保证同一角色在不同运行里得到相同结果喵。
     """
     pairs = load_pairs(csv_path, min_post_count=min_post_count,
-                       max_characters=max_characters, seed=seed)
+                       max_characters=max_characters)
     count = max(1, per_character)
     for index, item in enumerate(pairs):
         for step in range(count):

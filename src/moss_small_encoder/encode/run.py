@@ -52,25 +52,20 @@ def load_prompts(
     path: Path,
     limit: int | None,
     max_tokens: int,
-    seed: int = 20261027,
 ) -> list[dict]:
-    """读 prompts.jsonl、按 token 数降序批内分桶，再整体洗成随机序。
+    """读 prompts.jsonl，按 token 数降序返回。
 
     Args:
         path: 数据集文件。
         limit: 只取前多少条（按文件顺序），None 表示全部。
         max_tokens: 超过这个 token 数的样本丢弃。
-        seed: 洗牌种子，固定值保证重跑编码结果一致。
 
     Returns:
-        样本列表，整体已随机打乱（写入 raw 的行序 = 训练时的读序）。
+        样本列表，按 token 数降序排列。
 
     Notes:
-        排序与洗牌都在这里做一次，两遍编码复用同一份顺序，保证
-        teacher.raw 与 student.raw 逐行对齐。流程：先按长度降序
-        （同批样本长度接近，减少 padding 浪费），再整表洗牌——
-        两个操作都不影响行内对齐，只决定文件的物理行序。
-        洗过的顺序让训练端纯顺序读就等于随机 SGD，无需任何下标机关。
+        只排序不打乱，编码写入 raw 的行序 = 这个顺序，两遍编码复用同一份顺序，
+        保证 teacher.raw 与 student.raw 逐行对齐喵。
     """
     rows: list[dict] = []
     with path.open(encoding="utf-8") as handle:
@@ -82,7 +77,6 @@ def load_prompts(
             if limit is not None and len(rows) >= limit:
                 break
     rows.sort(key=lambda row: row["n_tokens"], reverse=True)
-    np.random.default_rng(seed).shuffle(rows)
     return rows
 
 
