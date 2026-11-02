@@ -803,6 +803,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--dry-run", action="store_true", help="只统计，不写文件")
     parser.add_argument(
+        "--sort",
+        choices=("length", "bucket"),
+        default="length",
+        help="输出顺序：length 按 token 数排序（默认，编码时补齐最少），bucket 按桶与 id",
+    )
+    parser.add_argument(
         "--tokenizer", type=Path, default=Path("models/tokenizer/tokenizer.json")
     )
     args = parser.parse_args(argv)
@@ -851,7 +857,11 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
 
-    all_rows.sort(key=lambda r: (r["bucket"], r["id"]))
+    if args.sort == "length":
+        # 默认按 token 长度排序：编码时批内长度接近，补齐浪费最小喵
+        all_rows.sort(key=lambda r: (int(r["n_tokens"]), r["id"]))
+    else:
+        all_rows.sort(key=lambda r: (r["bucket"], r["id"]))
     order = [bucket["name"] for bucket in cfg["buckets"]]
 
     if args.dry_run:
