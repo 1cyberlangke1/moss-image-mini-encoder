@@ -879,17 +879,48 @@ def train_finetune(
         payload = torch.load(resume, map_location="cpu", weights_only=False)
         start_step = int(payload["step"])
         lora_dir = resume.parent / f"lora_step_{start_step:06d}"
-        # peft 存的键带 base_model.model. 前缀，须用 PeftModel.from_pretrained 装喵
-        from peft import PeftModel
+        # 直接装进已建好的那一个适配器喵：再从外面套一层 PeftModel 会产生同名
+        # 双适配器，训练改的是内层、存盘写出的是外层，两代检查点因此原地踏步喵
+        from safetensors.torch import load_file
 
-        peft_model = PeftModel.from_pretrained(
-            model, str(lora_dir), is_trainable=True,
-            adapter_name="default",
+        state = {
+            k: v.to(device) for k, v in load_file(
+                str(lora_dir / "adapter_model.safetensors")
+            ).items()
+        }
+        own = peft_model.state_dict()
+        # 文件里的键不带 `.default.` 段，内存里的键带喵；先建一张映射再装喵
+        norm = {k.replace(".default.", "."): k for k in own}
+        pairs = []
+        for file_key, tensor in state.items():
+            mem_key = norm.get(file_key)
+            if mem_key is not None and own[mem_key].shape == tensor.shape:
+                pairs.append((mem_key, file_key))
+        if len(pairs) != len(state):
+            raise RuntimeError(
+                f"LoRA 键不匹配：文件 {len(state)} 个，可装入 {len(pairs)} 个喵"
+            )
+        peft_model.load_state_dict(
+            {mem_key: state[file_key] for mem_key, file_key in pairs}, strict=False
         )
-        peft_model.to(device)
+        after = peft_model.state_dict()
+        diff = max(
+            float((after[m].float() - state[f].float()).abs().max())
+            for m, f in pairs
+        )
+        if diff != 0.0:
+            raise RuntimeError(f"LoRA 装入后与文件不一致，最大差 {diff:.3e} 喵")
         opt.load_state_dict(payload["optimizer"])
         sched.load_state_dict(payload["scheduler"])
-        print(f"从 {resume.name} 恢复到第 {start_step} 步（LoRA 来自 {lora_dir.name}）", flush=True)
+        print(
+            f"从 {resume.name} 恢复到第 {start_step} 步"
+            f"（LoRA 来自 {lora_dir.name}，{len(pairs)} 个张量逐位一致）",
+            flush=True,
+        )
+
+    adapters = list(getattr(peft_model, "peft_config", {}) or {})
+    if len(adapters) != 1:
+        raise RuntimeError(f"适配器数量异常：{adapters} 喵")
 
     # 池子预扩（显存预热喵，与学习率 warmup 无关喵）：用每个档位的**真实形状**
     # （B=budget//tier，T=tier）各跑一次假前向假反向喵，缓存池一次性建到
@@ -1023,8 +1054,23 @@ def train_finetune(
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
+            before_step = {
+                name: p.detach().clone()
+                for name, p in peft_model.named_parameters()
+                if p.requires_grad
+            }
             torch.nn.utils.clip_grad_norm_(params, config.grad_clip)
             opt.step()
+            if step == start_step:
+                # 第一步必须证明优化器真的改到了被保存的那份参数喵
+                moved = max(
+                    float((p.detach() - before_step[name]).abs().max())
+                    for name, p in peft_model.named_parameters()
+                    if p.requires_grad
+                )
+                if moved == 0.0:
+                    raise RuntimeError("第一步之后可训练参数没有任何变化喵")
+                print(f"第一步参数最大变化 {moved:.3e}（训练确实在改权重喵）", flush=True)
             sched.step()
             step += 1
             del taps_out, hidden_full, hidden, teacher_flat, loss
@@ -1132,6 +1178,38 @@ def self_check(
     return parts
 
 
+def _verify_saved_adapter(peft_model, lora_dir: Path) -> None:
+    """校验刚写出的适配器与内存中的 LoRA 参数逐位相同喵。
+
+    输入: PeftModel、刚写好的 `lora_step_XXXXXX` 目录喵。
+    输出: 无返回值喵；缺键或数值不一致时抛 RuntimeError 喵。
+    预期: 内存里每个含 `lora_` 的状态张量都能在文件里找到同名项，
+        且最大绝对差为 0 喵。
+    """
+    from safetensors.torch import load_file
+
+    saved = load_file(str(lora_dir / "adapter_model.safetensors"))
+    # 单适配器存盘时文件里的键不带 `.default.` 段，比对前先去掉喵
+    own = {}
+    for name, tensor in peft_model.state_dict().items():
+        if "lora_" not in name:
+            continue
+        own[name.replace(".default.", ".")] = tensor
+    missing = [name for name in own if name not in saved]
+    if missing:
+        raise RuntimeError(
+            f"落盘缺少 {len(missing)} 个 LoRA 张量，例如 {missing[0]} 喵"
+        )
+    worst = 0.0
+    for name, tensor in own.items():
+        diff = float(
+            (tensor.detach().float().cpu() - saved[name].float()).abs().max()
+        )
+        worst = max(worst, diff)
+    if worst != 0.0:
+        raise RuntimeError(f"落盘 LoRA 与内存不一致，最大差 {worst:.3e} 喵")
+
+
 def save_checkpoint(
     peft_model, opt, sched, step: int, out_dir: Path, keep_last: int = 0
 ) -> None:
@@ -1156,6 +1234,8 @@ def save_checkpoint(
         path,
     )
     peft_model.save_pretrained(str(out_dir / f"lora_step_{step:06d}"))
+    # 存盘必须与内存逐位相同喵：曾出现写出的永远是启动时那份旧适配器喵
+    _verify_saved_adapter(peft_model, out_dir / f"lora_step_{step:06d}")
     if keep_last > 0:
         olds = sorted(out_dir.glob("checkpoint_step_*.pt"))
         for old in olds[:-keep_last] if len(olds) > keep_last else []:
