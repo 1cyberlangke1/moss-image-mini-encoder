@@ -1,7 +1,9 @@
-"""9B teacher 文本编码器的加载与前向。
+"""统一的文本编码器：教师（单文件量化权重）与学生（目录权重）共用。
 
 MOSS-Image 用的是 **Qwen3.5-9B 的最后一层隐状态**（`text_encoder.py:35` layer="last"，
-不带 lm_head）。这里的加载路径：
+不带 lm_head）。学生侧要记的是同一套隐状态，只是维度不同。
+
+量化加载路径：
 
 1. 用 `transformers` 的 `Qwen3_5TextModel` 在 meta 设备上搭结构（真权重 18.4 GB
    bf16，8 GB 显存放不下，也不能先在 CPU 上实体化）；
@@ -28,6 +30,7 @@ from transformers.utils import (
 
 from .common import MODEL_PREFIX, build_config, restore_rope, restore_ssm_dtype
 from ..packing import packed_forward_kwargs
+from .base import _EncoderBase
 
 from .quant import (
     build_int8_tensorwise,
@@ -219,45 +222,79 @@ def _require_packed_deps() -> None:
         )
 
 
-class TeacherEncoder:
-    """Qwen3.5-9B 的 w4a8 权重编码器（只出最后一层隐状态）。
+class TextEncoder(_EncoderBase):
+    """统一的文本编码器：目录权重或单文件量化权重，补齐与变长两种前向喵。
 
-    Args:
-        ckpt_path: `qwen3.5_9b_w4a8_gptq.safetensors`。
-        config_path: 9B 的 config.json。
-        device: 计算设备，默认 cuda。
-        dtype: 激活与输出 dtype，默认 bfloat16。
-
-    Attributes:
-        model: `Qwen3_5TextModel`，全部参数冻结。
-        hidden_size: 输出维度（4096）。
-
-    Notes:
-        构造完显存占用 = 量化权重 6.84 GiB + int8 词表 1.0 GiB + 激活。
-        8 GB 卡上批量前向要自己控制 token 预算。
+    输入: 模型目录（含 config.json 与分片）或单个 safetensors 加 config 路径喵。
+    输出: 具备 `encode` / `encode_packed` 的编码器，隐层维度见 `hidden_size`喵。
+    预期: 两种装载方式只保留一份实现，前向逻辑全部来自 `_EncoderBase`喵。
     """
 
     def __init__(
         self,
-        ckpt_path: Path | str,
-        config_path: Path | str,
+        source: Path | str,
+        config_path: Path | str | None = None,
         device: str | torch.device = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         verbose: bool = False,
         packed: bool = False,
+        quant_path: Path | str | None = None,
     ) -> None:
         self.device = torch.device(device)
         self.dtype = dtype
         self.packed = packed
         if packed:
             _require_packed_deps()
-        config = build_config(Path(config_path))
-        # packed 走 flash_attention_2：只有它的 varlen 接口认 cu_seqlens，
-        # sdpa 会静默忽略这些键，结果就是跨段串味而不报错。
-        config._attn_implementation = "flash_attention_2" if packed else "sdpa"
 
-        with torch.device("meta"):
-            model = Qwen3_5TextModel(config)
+        if config_path is None:
+            model_dir = Path(source)
+            config = build_config(model_dir / "config.json")
+            config._attn_implementation = "flash_attention_2" if packed else "sdpa"
+            if quant_path is None:
+                model = Qwen3_5TextModel(config)
+                shards = sorted(model_dir.glob("model*.safetensors"))
+                if not shards:
+                    raise FileNotFoundError(f"{model_dir} 下没有 safetensors")
+                state: dict[str, torch.Tensor] = {}
+                for shard in shards:
+                    with safe_open(str(shard), framework="pt", device="cpu") as handle:
+                        for key in handle.keys():
+                            if key.startswith(MODEL_PREFIX):
+                                state[key[len(MODEL_PREFIX):]] = handle.get_tensor(key)
+                missing, unexpected = model.load_state_dict(state, strict=False)
+                del state
+                real_missing = [n for n in missing if "inv_freq" not in n]
+                if real_missing or unexpected:
+                    raise RuntimeError(
+                        f"权重不匹配：缺 {real_missing[:5]}（共 {len(real_missing)}），"
+                        f"多 {list(unexpected)[:5]}"
+                    )
+                restore_rope(model)
+                model.to(self.device, dtype=dtype)
+                restore_ssm_dtype(model)
+            else:
+                self._load_quantized(model, Path(quant_path))
+        else:
+            config = build_config(Path(config_path))
+            config._attn_implementation = "flash_attention_2" if packed else "sdpa"
+            with torch.device("meta"):
+                model = Qwen3_5TextModel(config)
+            self._load_quantized(model, Path(source))
+
+        model.eval()
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        self.model = model
+        self.hidden_size = int(config.hidden_size)
+
+    def _load_quantized(self, model, ckpt_path: Path) -> None:
+        """按 comfy 的量化格式装载权重喵。
+
+        输入: 空的（meta）模型与 safetensors 路径喵。
+        输出: 无返回值，模型被就地填充喵。
+        预期: 量化层走 comfy_kitchen，其余走普通张量，词表走 int8 反量化喵。
+        """
+        from .quant import is_asym_w4a8
 
         with safe_open(str(ckpt_path), framework="pt", device="cpu") as handle:
             keys = set(handle.keys())
@@ -273,77 +310,16 @@ class TeacherEncoder:
                 and key.startswith(MODEL_PREFIX)
                 and not is_asym_w4a8(key[: -len(".weight_scale")], keys)
             }
-            if verbose:
-                print(
-                    f"[teacher] 量化层 {len(quant_prefixes)} 个，int8 查表层 {len(int8_prefixes)} 个",
-                    flush=True,
-                )
-
-            self._load_plain(model, handle, keys, quant_prefixes | int8_prefixes)
-            self._swap_quantized(model, _TensorView(handle), quant_prefixes, int8_prefixes)
-
+            load_plain_tensors(
+                model, handle, keys, quant_prefixes | int8_prefixes, self.device
+            )
+            swap_quantized_modules(
+                model,
+                _TensorView(handle),
+                quant_prefixes,
+                int8_prefixes,
+                self.device,
+                self.dtype,
+            )
         restore_rope(model)
         restore_ssm_dtype(model)
-        model.eval()
-        for parameter in model.parameters():
-            parameter.requires_grad_(False)
-        self.model = model
-        self.hidden_size = int(config.hidden_size)
-
-    def _load_plain(self, model, handle, keys, quant_prefixes) -> None:
-        """见模块级 `load_plain_tensors`。"""
-        load_plain_tensors(model, handle, keys, quant_prefixes, self.device)
-
-    def _swap_quantized(self, model, handle, quant_prefixes, int8_prefixes) -> None:
-        """见模块级 `swap_quantized_modules`。"""
-        swap_quantized_modules(
-            model, handle, quant_prefixes, int8_prefixes, self.device, self.dtype
-        )
-
-    @torch.inference_mode()
-    def encode(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """跑一次前向，返回最后一层隐状态。
-
-        Args:
-            input_ids: `[B, T]` int64，右侧 padding，且 pad 值必须是 248044。
-            attention_mask: `[B, T]`，1 表示真实 token。None 表示全是真实 token。
-
-        Returns:
-            `[B, T, 4096]` bf16。padding 位置的值无意义，调用方按 mask 取。
-
-        Notes:
-            右 padding + causal mask 下，真实 token 不会看到后面的 pad，
-            所以只要按 mask 截取，结果与逐条编码一致。
-        """
-        out = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-        )
-        return out.last_hidden_state
-
-    @torch.inference_mode()
-    def encode_packed(self, input_ids: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
-        """把多条序列首尾相接，一次前向，返回拼平后的隐状态。
-
-        Args:
-            input_ids: `[1, total]` int64，多条 prompt 的 token 直接连在一起，中间不插 pad。
-            cu_seqlens: `[N + 1]` int32，累积长度，单调递增且首项为 0、末项为 total。
-
-        Returns:
-            `[1, total, hidden]` bf16。第 i 条序列对应 `cu_seqlens[i] : cu_seqlens[i + 1]`。
-
-        Notes:
-            `position_ids` 与 `seq_idx` 都从 `cu_seqlens` 反推，不额外传参，避免两边不一致。
-            `position_ids` 按段从 0 重开，否则第 2 条起会带上前一条的位置偏移。
-            `seq_idx` 让 kernel 等于 4 的 causal conv1d 在段边界重置，
-            否则前一条的尾部会卷进后一条的开头。
-            `attention_mask` 传字典是为了跳过 mask 构造：varlen 分支要求它是 None。
-        """
-        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        out = self.model(
-            input_ids=input_ids,
-            use_cache=False,
-            **packing_forward_kwargs(cu_seqlens),
-        )
-        return out.last_hidden_state

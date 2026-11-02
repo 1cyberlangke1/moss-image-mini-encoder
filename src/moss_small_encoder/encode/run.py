@@ -28,8 +28,7 @@ import numpy as np
 import torch
 
 from ..tokenizer import MAX_TEXT_TOKENS, MossTokenizer
-from .student import StudentEncoder
-from .teacher import TeacherEncoder
+from .encoder import TextEncoder
 
 TEACHER_CKPT = Path("models/qwen3.5_9b_w4a8_gptq.safetensors")
 TEACHER_CFG = Path("models/qwen3.5-9b/config.json")
@@ -452,7 +451,7 @@ def _verify_packed_against_stored(
     input_ids = torch.tensor(flat, dtype=torch.long, device=device).unsqueeze(0)
     cu_seqlens = torch.tensor(bounds, dtype=torch.int32, device=device)
     with torch.inference_mode():
-        hidden = teacher.encode_packed(input_ids, cu_seqlens)
+        hidden = teacher.encode_packed(input_ids, cu_seqlens)[-1]
     got_all = hidden[0].to(torch.float64).cpu().numpy()
 
     per_prompt: list[float] = []
@@ -566,7 +565,7 @@ def _run_teacher_pass(
     batches = make_batches(remaining, budget, max_prompts, packed=packed)
     total = sum(row["n_tokens"] for row in rows)
     started = time.time()
-    teacher = TeacherEncoder(TEACHER_CKPT, TEACHER_CFG, device=device, packed=packed)
+    teacher = TextEncoder(TEACHER_CKPT, config_path=TEACHER_CFG, device=device, packed=packed)
     print(
         f"[teacher] 就位 {time.time() - started:.1f}s，显存 {torch.cuda.memory_allocated()/1e9:.2f} GB"
         + (f"，从第 {start} 条续跑" if start else ""),
@@ -592,7 +591,7 @@ def _run_teacher_pass(
             if packed:
                 input_ids, cu_seqlens, batch_lengths = pack_batch(batch, tokenizer, device)
                 with torch.inference_mode():
-                    hidden = teacher.encode_packed(input_ids, cu_seqlens)
+                    hidden = teacher.encode_packed(input_ids, cu_seqlens)[-1]
                 begins = cu_seqlens[:-1].tolist()
                 # sink 必须在压成 fp16 之前取：token 0 的范数远大于正文，
                 # 先压再累加会引入舍入误差，极端情况还会溢出成 inf。
@@ -607,7 +606,7 @@ def _run_teacher_pass(
             else:
                 input_ids, attention_mask, batch_lengths = pad_batch(batch, tokenizer, device)
                 with torch.inference_mode():
-                    hidden = teacher.encode(input_ids, attention_mask)
+                    hidden = teacher.encode(input_ids, attention_mask)[-1]
                 # 直接转 fp16 再回 CPU：落盘就是 fp16，先转 fp32 等于把 PCIe 传输量翻倍。
                 hidden_np = hidden.to(torch.float16).cpu().numpy()
                 # sink 必须用转换前的值累加：token 0 的范数远大于正文，
@@ -674,6 +673,7 @@ def _run_student_pass(
     max_aspect: float = 3.0,
     student_dir: Path = STUDENT_DIR,
     quant_path: Path | None = None,
+    packed: bool = False,
 ) -> float:
     """student 遍：装学生模型，逐个 prompt 写 `student.raw`。
 
@@ -713,10 +713,10 @@ def _run_student_pass(
 
     start = int(resume["done"]) if resume else 0
     remaining = rows[start:]
-    batches = make_batches(remaining, budget, max_prompts, max_aspect=max_aspect)
+    batches = make_batches(remaining, budget, max_prompts, max_aspect=max_aspect, packed=packed)
     total = sum(row["n_tokens"] for row in rows)
     started = time.time()
-    student = StudentEncoder(student_dir, device=device, quant_path=quant_path)
+    student = TextEncoder(student_dir, device=device, quant_path=quant_path, packed=packed)
     print(
         f"[student] 就位 {time.time() - started:.1f}s，显存 {torch.cuda.memory_allocated()/1e9:.2f} GB"
         + (f"，从第 {start} 条续跑" if start else ""),
@@ -776,17 +776,33 @@ def _run_student_pass(
         )
         writer_thread.start()
         for index, batch in enumerate(batches, 1):
-            input_ids, attention_mask, batch_lengths = pad_batch(batch, tokenizer, device)
-            with torch.inference_mode():
-                hidden = student.encode(input_ids, attention_mask, taps=taps)
-            # 沿特征维拼接多层：第 i 个 token 得到 各层隐状态 的串接。
-            hidden_np = torch.cat(
-                [hidden[t].to(torch.float16) for t in taps], dim=-1
-            ).cpu().numpy()
-            rows_np = [
-                hidden_np[row_index, :length]
-                for row_index, length in enumerate(batch_lengths)
-            ]
+            if packed:
+                input_ids, cu_seqlens, batch_lengths = pack_batch(
+                    batch, tokenizer, device
+                )
+                with torch.inference_mode():
+                    hidden = student.encode_packed(input_ids, cu_seqlens, taps=taps)
+                flat = torch.cat(
+                    [hidden[t].to(torch.float16) for t in taps], dim=-1
+                )[0].cpu().numpy()
+                bounds = cu_seqlens.tolist()
+                rows_np = [
+                    flat[bounds[i] : bounds[i + 1]] for i in range(len(batch))
+                ]
+            else:
+                input_ids, attention_mask, batch_lengths = pad_batch(
+                    batch, tokenizer, device
+                )
+                with torch.inference_mode():
+                    hidden = student.encode(input_ids, attention_mask, taps=taps)
+                # 沿特征维拼接多层：第 i 个 token 得到 各层隐状态 的串接。
+                hidden_np = torch.cat(
+                    [hidden[t].to(torch.float16) for t in taps], dim=-1
+                ).cpu().numpy()
+                rows_np = [
+                    hidden_np[row_index, :length]
+                    for row_index, length in enumerate(batch_lengths)
+                ]
             produced_tokens += sum(batch_lengths)
             write_queue.put((index, rows_np))
             if errors:
@@ -995,6 +1011,7 @@ def main(argv: list[str] | None = None) -> int:
             args.student_max_aspect,
             args.student_dir,
             args.student_quant,
+            args.packed,
         )
 
     np.save(args.out / "sink.npy", sink)

@@ -41,11 +41,13 @@ class _FakeTeacher:
         self.hidden_size = hidden_size
         self.payload = payload
 
-    def encode_packed(self, input_ids: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
-        """返回与 `payload` 完全一致的隐状态。"""
+    def encode_packed(
+        self, input_ids: torch.Tensor, cu_seqlens: torch.Tensor
+    ) -> dict[int, torch.Tensor]:
+        """返回与 `payload` 完全一致的隐状态，键 -1 表示最后一层。"""
         assert input_ids.shape == (1, self.payload.shape[0])
         assert int(cu_seqlens[-1]) == self.payload.shape[0]
-        return torch.from_numpy(self.payload.astype(np.float32)).unsqueeze(0)
+        return {-1: torch.from_numpy(self.payload.astype(np.float32)).unsqueeze(0)}
 
 
 def _rows(lengths: list[int]) -> list[dict]:
@@ -149,7 +151,7 @@ def test_require_packed_deps_rejects_missing_kernel(monkeypatch) -> None:
     输出: ImportError，信息里点名 causal-conv1d
     预期: 退化版 conv1d 不看 seq_idx，会跨段串味且不报错，所以入口就要拦
     """
-    from moss_small_encoder.encode import teacher as teacher_module
+    from moss_small_encoder.encode import encoder as teacher_module
 
     monkeypatch.setattr(teacher_module, "is_causal_conv1d_available", lambda: False)
     with pytest.raises(ImportError, match="causal-conv1d"):
