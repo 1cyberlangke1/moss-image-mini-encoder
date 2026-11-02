@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .mlp import MLPConfig, save, save_linear, train
+from .export import save_linear
 from .ridge import (
     RidgeAccumulator,
     check_ram_limit,
@@ -346,29 +346,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--features", type=Path, default=Path("dataset/features/v1"))
     parser.add_argument("--out", type=Path, default=Path("output/projection.safetensors"))
-    parser.add_argument("--checkpoint-dir", type=Path, default=Path("output/checkpoints"), help="检查点目录")
-    parser.add_argument("--save-every-steps", type=int, default=25, help="每间隔 X 步保存一次检查点")
-    parser.add_argument("--keep-last", type=int, default=3, help="只保留最近 X 个检查点（防止磁盘撑爆）")
-    parser.add_argument("--resume", type=str, default=None, help="断点续训路径（或 'auto' 自动寻找最新检查点）")
-    parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--hidden", type=int, default=None)
     parser.add_argument(
         "--tap-index",
         type=int,
         default=None,
         help="只用多 tap 特征里的第 K 块（0 起，顺序同 meta.json 的 taps）",
-    )
-    parser.add_argument(
-        "--mlp-buf-budget-gb",
-        type=float,
-        default=None,
-        help="残差训练单侧 fp16 镜像的预算 GiB；默认按启动时可用内存自动定",
-    )
-    parser.add_argument(
-        "--max-ram-gb",
-        type=float,
-        default=None,
-        help="进程提交量熔断线 GiB；默认取物理内存的 65%%",
     )
     parser.add_argument("--batch", type=int, default=None, help="训练 batch 大小（token 数）。默认根据显存自动吃满")
     parser.add_argument("--chunk-tokens", type=int, default=None, help="流式读取缓冲区大小（token 数）")
@@ -383,23 +365,6 @@ def main(argv: list[str] | None = None) -> int:
         "--recompute-ridge",
         action="store_true",
         help="忽略特征目录里的 Ridge 缓存，强制重新累加与 λ 扫描",
-    )
-    parser.add_argument(
-        "--linear-only",
-        action="store_true",
-        help="只解 Ridge 线性投影并导出，不训练残差 MLP",
-    )
-    parser.add_argument(
-        "--lr", type=float, default=None, help="残差网络学习率（默认 1e-3；残差应远小于主体，过大会冲垮闭式解）"
-    )
-    parser.add_argument(
-        "--eval-every-steps", type=int, default=0, help="轮内每 N 步评估一次验证余弦（0=关闭）"
-    )
-    parser.add_argument(
-        "--linear-mode",
-        choices=["joint", "frozen"],
-        default=None,
-        help="joint: W 与残差一起训（会拉偏闭式解）；frozen: W 冻结，只训残差（参考项目主配置）",
     )
     parser.add_argument("--smoke", action="store_true", help="小规模验证通道，不看指标")
     parser.add_argument(
@@ -574,68 +539,6 @@ def main(argv: list[str] | None = None) -> int:
     sink_vec = compute_sink(reader, np.arange(reader.n_prompts))
     save_linear(linear_out, best_solution, meta=linear_meta, sink=sink_vec)
     print(f"【纯线性 Ridge 基础权重已就绪】: {linear_out}", flush=True)
-
-    if args.linear_only:
-        # 0.8B 上残差网络实测只涨 +0.00014（1e-4 量级），训练它没有意义。
-        # 这个开关让「产出最终适配器」变成一次纯闭式解，几秒到两分钟。
-        print("\n--linear-only：跳过残差 MLP 训练，产物已导出", flush=True)
-        return 0
-
-    # 3. 残差 MLP 训练：利用自适应 batch 吃满 GPU 算力加速训练
-    print("\n--- 阶段 3: 残差网络训练 (MLP) ---", flush=True)
-    config = MLPConfig()
-    config.batch = batch_size
-    config.chunk_tokens = chunk_tokens
-    config.buf_budget_gb = args.mlp_buf_budget_gb
-    config.max_process_ram_gb = args.max_ram_gb
-    config.checkpoint_dir = str(args.checkpoint_dir)
-    config.save_every_steps = args.save_every_steps
-    config.keep_last_checkpoints = args.keep_last
-    config.resume = args.resume
-    if args.smoke:
-        config.hidden = 2048
-        config.depth = 2
-        config.epochs = 3
-        config.patience = 3
-        config.eval_tokens = 50_000
-    else:
-        config.eval_tokens = args.eval_tokens
-
-    if args.hidden is not None:
-        config.hidden = args.hidden
-    if args.epochs is not None:
-        config.epochs = args.epochs
-    if args.linear_mode is not None:
-        config.linear_mode = args.linear_mode
-    if args.lr is not None:
-        config.lr = args.lr
-    if args.eval_every_steps:
-        config.eval_every_steps = args.eval_every_steps
-
-    print(
-        f"网络配置: hidden={config.hidden}, depth={config.depth}, batch={config.batch}, epochs={config.epochs}",
-        flush=True,
-    )
-
-    result = train(reader, best_solution, config, log=lambda text: print(text, flush=True))
-    print(
-        f"\n训练结束 ({result.epochs_run} 轮): Ridge 基准 {result.base_val_cosine:.5f} -> "
-        f"MLP {result.best_val_cosine:.5f} (净提升: {result.improvement():+.5f})",
-        flush=True,
-    )
-
-    # 4. 导出 safetensors 适配器
-    meta = {
-        "tap": json.loads((args.features / "meta.json").read_text(encoding="utf-8")).get("tap", -1),
-        "train_prompts": int(splits["train"].size),
-        "train_tokens": train_token_count,
-        "val_cosine": f"{result.best_val_cosine:.6f}",
-        "source": "qwen3.5-0.8b",
-        "target": "qwen3.5-9b",
-    }
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    save(args.out, best_solution, result, config, meta=meta)
-    print(f"产物已导出: {args.out}", flush=True)
 
     reader.close()
     return 0

@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from moss_small_encoder.train.mlp import save_linear
+from moss_small_encoder.train.export import save_linear
 from moss_small_encoder.train.ridge import RidgeSolution
 
 REQUIRED = {"weight", "mean_in", "std_in", "mean_out", "std_out"}
