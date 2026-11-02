@@ -402,9 +402,18 @@ def main(argv: list[str] | None = None) -> int:
         help="joint: W 与残差一起训（会拉偏闭式解）；frozen: W 冻结，只训残差（参考项目主配置）",
     )
     parser.add_argument("--smoke", action="store_true", help="小规模验证通道，不看指标")
+    parser.add_argument(
+        "--no-tf32",
+        action="store_true",
+        help="关掉 TF32，fp32 矩阵乘退回普通 CUDA 核（慢 3~5 倍，用于对照精度）",
+    )
     args = parser.parse_args(argv)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    # TF32：fp32 矩阵乘走张量核，指数保留 8 位、尾数截到 10 位，累加仍是 fp32。
+    # XᵀX 全正项求和的相对误差在 1e-6 量级，正规方程完全吃得下。
+    torch.backends.cuda.matmul.allow_tf32 = not args.no_tf32
+    print(f"TF32: {'关' if args.no_tf32 else '开'}", flush=True)
     reader = StreamReader(args.features)
     tap_blocks = json.loads((args.features / "meta.json").read_text(encoding="utf-8")).get("taps") or [-1]
     if args.tap_index is not None:
