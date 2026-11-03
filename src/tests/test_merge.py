@@ -127,3 +127,58 @@ def test_missing_source_is_skipped(tmp_path: Path, monkeypatch) -> None:
     assert merge.main(["--out", str(out)]) == 0
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["rows"] == 1
+
+def test_sort_length_orders_descending(tmp_path: Path, monkeypatch) -> None:
+    """给 --sort length 时输出必须按 n_tokens 降序喵。"""
+    kb = tmp_path / "kb.jsonl"
+    replay = tmp_path / "replay.jsonl"
+    _write(kb, [_record(f"kb:{i}", "characters", tokens=t) for i, t in enumerate([5, 50, 1, 20])])
+    _write(replay, [_record(f"replay:{i}", "en_tag", tokens=t) for i, t in enumerate([3, 90, 7])])
+    monkeypatch.setattr(merge, "SOURCES", (("kb", kb), ("replay", replay)))
+
+    out = tmp_path / "corpus"
+    assert merge.main(["--out", str(out), "--sort", "length"]) == 0
+    rows = [json.loads(line) for line in (out / "prompts.jsonl").read_text(encoding="utf-8").splitlines()]
+    tokens = [int(row["n_tokens"]) for row in rows]
+    assert tokens == sorted(tokens, reverse=True)
+    assert tokens[0] == 90 and tokens[-1] == 1
+
+
+def test_sort_length_is_stable_on_ties(tmp_path: Path, monkeypatch) -> None:
+    """同长度时保持来源拼接顺序（kb 在 replay 之前）喵。"""
+    kb = tmp_path / "kb.jsonl"
+    replay = tmp_path / "replay.jsonl"
+    _write(kb, [_record("kb:a", "characters", tokens=10), _record("kb:b", "characters", tokens=10)])
+    _write(replay, [_record("replay:a", "en_tag", tokens=10)])
+    monkeypatch.setattr(merge, "SOURCES", (("kb", kb), ("replay", replay)))
+
+    out = tmp_path / "corpus"
+    assert merge.main(["--out", str(out), "--sort", "length"]) == 0
+    rows = [json.loads(line) for line in (out / "prompts.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [row["id"] for row in rows] == ["kb:a", "kb:b", "replay:a"]
+
+
+def test_sort_none_keeps_concatenation_order(tmp_path: Path, monkeypatch) -> None:
+    """默认不给 --sort 时保持来源拼接顺序喵。"""
+    kb = tmp_path / "kb.jsonl"
+    replay = tmp_path / "replay.jsonl"
+    _write(kb, [_record("kb:a", "characters", tokens=1)])
+    _write(replay, [_record("replay:a", "en_tag", tokens=99)])
+    monkeypatch.setattr(merge, "SOURCES", (("kb", kb), ("replay", replay)))
+
+    out = tmp_path / "corpus"
+    assert merge.main(["--out", str(out)]) == 0
+    rows = [json.loads(line) for line in (out / "prompts.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [row["id"] for row in rows] == ["kb:a", "replay:a"]
+
+def test_dedupe_none_keeps_duplicate_ids(tmp_path: Path, monkeypatch) -> None:
+    """给 --dedupe none 时同 id 但文本不同的行都要保留喵。"""
+    kb = tmp_path / "kb.jsonl"
+    _write(kb, [_record("dup:1", "layout", tokens=3), _record("dup:1", "layout", tokens=4)])
+    monkeypatch.setattr(merge, "SOURCES", (("kb", kb),))
+
+    out = tmp_path / "corpus"
+    assert merge.main(["--out", str(out), "--dedupe", "none"]) == 0
+    rows = [json.loads(line) for line in (out / "prompts.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 2
+    assert [int(r["n_tokens"]) for r in rows] == [3, 4]

@@ -120,6 +120,18 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="可选：train,val,test 三段比例，如 0.7,0.15,0.15；留空表示全部进 train",
     )
+    parser.add_argument(
+        "--sort",
+        choices=("none", "length"),
+        default="none",
+        help="输出行序：none 保持来源拼接顺序；length 按 n_tokens 降序（同长度保持原相对顺序）",
+    )
+    parser.add_argument(
+        "--dedupe",
+        choices=("id", "none"),
+        default="id",
+        help="按 id 去重：id 只保留第一条；none 保留全部（id 相同但文本不同的样本）",
+    )
     args = parser.parse_args(argv)
 
     ratios: tuple[float, float, float] | None = None
@@ -138,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
     unique: list[dict] = []
     dup = 0
     for row in rows:
-        if row["id"] in seen:
+        if args.dedupe == "id" and row["id"] in seen:
             dup += 1
             continue
         seen.add(row["id"])
@@ -154,6 +166,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if dup:
         print(f"  去重丢掉 {dup} 条重复 id", flush=True)
+
+    if args.sort == "length":
+        # 稳定排序：同长度保持 kb / hard_cases / replay 的原相对顺序喵
+        unique.sort(key=lambda row: int(row["n_tokens"]), reverse=True)
+        print("  按 n_tokens 降序重排", flush=True)
 
     write(unique, args.out)
     return 0
