@@ -656,6 +656,27 @@ def _run_teacher_pass(
     return lengths, sink, time.time() - started
 
 
+def _reclaim_if_spilled(device: torch.device, prompts_done: int) -> None:
+    """活跃显存超过专用物理显存时，把缓存块还给驱动喵。
+
+    输入: device 计算设备；prompts_done 已处理条数，仅用于日志喵。
+    输出: 无返回值喵。
+    预期: 未溢出时什么也不做；溢出时调用 empty_cache 并打印回收前后读数喵。
+    """
+    props = torch.cuda.get_device_properties(device)
+    allocated = torch.cuda.memory_allocated(device)
+    if allocated <= props.total_memory:
+        return
+    cached = torch.cuda.memory_reserved(device) - allocated
+    torch.cuda.empty_cache()
+    after = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    print(
+        f"[cache] 第 {prompts_done:,} 条 活跃 {allocated/1e9:.2f} GB > 物理 "
+        f"{props.total_memory/1e9:.2f} GB，池空闲 {cached/1e9:.2f} -> {after/1e9:.2f} GB喵",
+        flush=True,
+    )
+
+
 def _run_student_pass(
     rows: list[dict],
     tokenizer: MossTokenizer,
@@ -668,6 +689,7 @@ def _run_student_pass(
     student_dir: Path = STUDENT_DIR,
     quant_path: Path | None = None,
     packed: bool = False,
+    cache_check_every: int = 0,
 ) -> float:
     """student 遍：装学生模型，逐个 prompt 写 `student.raw`。
 
@@ -682,6 +704,10 @@ def _run_student_pass(
             （已过 final norm）。取同一 token 的不同深度，不做跨 token 混合。
         student_dir: 学生模型目录（0.8B 或 2B）。
         quant_path: 量化权重文件；给出时用 comfy_kitchen 的量化层装载喵。
+        packed: 为真时把整批拼成一条序列做一次 varlen 前向。
+        cache_check_every: 每处理这么多条 prompt 检查一次活跃显存；大于 0 时，
+            若活跃张量超过专用物理显存就调用 `empty_cache` 把空闲块还给驱动。
+            0 表示关闭，行为与不传该参数完全一致喵。
 
     Returns:
         耗时秒。
@@ -720,6 +746,8 @@ def _run_student_pass(
     written = start
     done = int(resume["tokens"]) if resume else 0
     produced_tokens = done
+    produced_prompts = written
+    next_cache_check = written + cache_check_every if cache_check_every else 0
     write_queue: queue.Queue = queue.Queue(maxsize=4)
     errors: list[BaseException] = []
 
@@ -798,9 +826,14 @@ def _run_student_pass(
                     for row_index, length in enumerate(batch_lengths)
                 ]
             produced_tokens += sum(batch_lengths)
+            produced_prompts += len(batch_lengths)
             write_queue.put((index, rows_np))
             if errors:
                 raise errors[0]
+
+            if cache_check_every and produced_prompts >= next_cache_check:
+                next_cache_check = produced_prompts + cache_check_every
+                _reclaim_if_spilled(device, produced_prompts)
 
             if index % 20 == 0 or index == len(batches):
                 elapsed = time.time() - started
@@ -908,6 +941,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="编码时批内最长/最短长度比上限；编码不吃梯度，放宽可减少批数与固定开销")
     parser.add_argument("--teacher-max-prompts", type=int, default=64, help="teacher 每批最多条数")
     parser.add_argument("--student-max-prompts", type=int, default=256, help="student 每批最多条数")
+    parser.add_argument(
+        "--cache-check-every",
+        type=int,
+        default=0,
+        help="每处理这么多条 prompt 检查一次活跃显存，超过专用物理显存就回收缓存块；0 关闭",
+    )
     parser.add_argument("--limit", type=int, default=None, help="只编码前 N 条")
     parser.add_argument(
         "--student-dir",
@@ -1006,6 +1045,7 @@ def main(argv: list[str] | None = None) -> int:
             args.student_dir,
             args.student_quant,
             args.packed,
+            args.cache_check_every,
         )
 
     np.save(args.out / "sink.npy", sink)
