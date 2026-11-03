@@ -92,20 +92,20 @@
 
 | 档位 | 整档缩略 |
 |---|---|
-| 9B w4a8（基准） | ![](images/matrix/9b.jpg) |
-| 4B w4a8 | ![](images/matrix/4b-w4a8.jpg) |
-| 2B bf16 | ![](images/matrix/2b-bf16.jpg) |
-| 2B int8 | ![](images/matrix/2b-int8.jpg) |
-| 2B w4a8 | ![](images/matrix/2b-w4a8.jpg) |
-| 0.8B bf16 | ![](images/matrix/08b-bf16.jpg) |
-| 0.8B int8 | ![](images/matrix/08b-int8.jpg) |
-| 0.8B w4a8 | ![](images/matrix/08b-w4a8.jpg) |
+| 9B w4a8（基准） | ![](images/matrix/9b.webp) |
+| 4B w4a8 | ![](images/matrix/4b-w4a8.webp) |
+| 2B bf16 | ![](images/matrix/2b-bf16.webp) |
+| 2B int8 | ![](images/matrix/2b-int8.webp) |
+| 2B w4a8 | ![](images/matrix/2b-w4a8.webp) |
+| 0.8B bf16 | ![](images/matrix/08b-bf16.webp) |
+| 0.8B int8 | ![](images/matrix/08b-int8.webp) |
+| 0.8B w4a8 | ![](images/matrix/08b-w4a8.webp) |
 
 ### 关键提示的四档对比（9B / 4B / 2B w4a8 / 0.8B bf16）
 
 第 2 条（只给角色名「蔚蓝档案的鬼方カヨコ蹲在巷子里喂流浪猫」）：
 
-![](images/compare/prompt-02.jpg)
+![](images/compare/prompt-02.webp)
 
 | 档位 | 画成什么 |
 |---|---|
@@ -116,7 +116,7 @@
 
 第 4 条（只给品牌名「蜜雪冰城的雪王站在店门口」）：
 
-![](images/compare/prompt-04.jpg)
+![](images/compare/prompt-04.webp)
 
 | 档位 | 画成什么 |
 |---|---|
@@ -127,11 +127,11 @@
 
 第 7 条（四格漫画 + 指定台词）：
 
-![](images/compare/prompt-07.jpg)
+![](images/compare/prompt-07.webp)
 
 第 10 条（627 token 的长 JSON）：
 
-![](images/compare/prompt-10.jpg)
+![](images/compare/prompt-10.webp)
 
 ## 条件向量矩阵
 
@@ -207,3 +207,38 @@
 ## 复现
 
 出图流程使用 ComfyUI 与 `MossCLIPLoader` 节点，按上述「口径」表配置参数即可复现对应的出图结果与耗时。节点使用方法见 [comfyui-node.md](comfyui-node.md)。
+
+## 附加对照：SD tag 与中文自然语言
+
+### 原始提示词
+
+固定条件：1024×1024、seed 42、4 步、cfg 1.0、euler / sgm_uniform、LoRA `MOSS-Image-SFT-4-steps`。
+
+**A · SD tag 提示词（JSON 布局）**：
+
+```json
+{"summary": {"caption": "城市街头，砂狼シロコ正在单腿跳跃飞踢，身旁立着木牌，阳光明媚，写实构图", "meta": {}, "canvas": {"width": 1024, "height": 1024}}, "items": [{"label": "character", "caption": "1girl, shiroko_(blue_archive), jumping, flying_kick, dynamic_pose, looking_at_viewer", "bbox": [-362.0, -412.0, 438.0, 168.0]}, {"label": "text", "caption": "右侧路边立着的木制招牌", "bbox": [-162.0, 208.0, 238.0, 448.0], "text": "阿拜多斯"}], "bbox_coord_space": "abs_centralized", "bbox_format": "yxyx"}
+```
+
+**B · 中文自然语言提示词（JSON 布局）**：
+
+```json
+{"summary": {"caption": "城市街头，蔚蓝档案的砂狼白子正在单腿跳跃飞踢，身旁立着木牌，阳光明媚，写实构图", "meta": {}, "canvas": {"width": 1024, "height": 1024}}, "items": [{"label": "character", "caption": "一个少女，蔚蓝档案的砂狼白子，单腿跳跃飞踢，动态姿势，看着镜头", "bbox": [-362.0, -412.0, 438.0, 168.0]}, {"label": "text", "caption": "右侧路边立着的木制招牌", "bbox": [-162.0, 208.0, 238.0, 448.0], "text": "阿拜多斯"}], "bbox_coord_space": "abs_centralized", "bbox_format": "yxyx"}
+```
+
+### 图片矩阵
+
+| 档位 | SD tag 提示词 | 中文自然语言提示词 |
+|---|---|---|
+| 0.8B bf16 | ![](images/matrix-tag-vs-cn/08b-bf16-tag.webp) | ![](images/matrix-tag-vs-cn/08b-bf16-cn.webp) |
+| 0.8B int8 | ![](images/matrix-tag-vs-cn/08b-int8-tag.webp) | ![](images/matrix-tag-vs-cn/08b-int8-cn.webp) |
+| 0.8B w4a8 | ![](images/matrix-tag-vs-cn/08b-w4a8-tag.webp) | ![](images/matrix-tag-vs-cn/08b-w4a8-cn.webp) |
+| 2B bf16 | ![](images/matrix-tag-vs-cn/2b-bf16-tag.webp) | ![](images/matrix-tag-vs-cn/2b-bf16-cn.webp) |
+| 2B int8 | ![](images/matrix-tag-vs-cn/2b-int8-tag.webp) | ![](images/matrix-tag-vs-cn/2b-int8-cn.webp) |
+| 2B w4a8 | ![](images/matrix-tag-vs-cn/2b-w4a8-tag.webp) | ![](images/matrix-tag-vs-cn/2b-w4a8-cn.webp) |
+| 4B w4a8 | ![](images/matrix-tag-vs-cn/4b-w4a8-tag.webp) | ![](images/matrix-tag-vs-cn/4b-w4a8-cn.webp) |
+| 9B w4a8（基准） | ![](images/matrix-tag-vs-cn/9b-base-tag.webp) | ![](images/matrix-tag-vs-cn/9b-base-cn.webp) |
+
+### 结论
+
+模型对 danbooru tag 比中文自然语言更熟悉，至少在二次元角色这一块是这样；同一份布局、动作与文字约束下，英文 tag 能把角色外形锁住，中文专名往往只能锁住画风。

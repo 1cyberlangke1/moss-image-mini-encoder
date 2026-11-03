@@ -41,7 +41,7 @@ MOSS-Image 官方默认的 9B 文本编码器体积较大，在消费级显卡�
 
 > 蔚蓝档案的鬼方カヨコ蹲在巷子里喂流浪猫
 
-![四档对比](docs/images/compare/prompt-02.jpg)
+![四档对比](docs/images/compare/prompt-02.webp)
 
 | 档位 | 生成结果 | cos vs 9B | 端到端热态 |
 |---|---|---:|---:|
@@ -54,7 +54,7 @@ MOSS-Image 官方默认的 9B 文本编码器体积较大，在消费级显卡�
 
 > 蜜雪冰城的雪王站在店门口
 
-![四档对比](docs/images/compare/prompt-04.jpg)
+![四档对比](docs/images/compare/prompt-04.webp)
 
 | 档位 | 生成结果 |
 |---|---|
